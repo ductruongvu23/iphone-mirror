@@ -1,0 +1,15 @@
+# Bí mật / thông tin ghép đôi — KHÔNG đưa lên mạng
+bumble_mouse_keys.json
+selfIdentity.plist
+# File nhị phân lớn hoặc đã ký bằng chứng chỉ riêng
+ios.exe
+go-ios/
+devimages/
+WDA.ipa
+*.dll
+# Rác khi chạy
+*.log
+__pycache__/
+mac/build/
+# Bản sao lưu tạm
+*_before_diag.py

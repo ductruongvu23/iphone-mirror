@@ -1,0 +1,22 @@
+name: macOS build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Chọn Xcode mới nhất (có SDK macOS 26 thì bật kính lỏng gốc)
+        run: |
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$X"
+          swift --version
+      - run: bash mac/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iPhoneMirror-mac
+          path: mac/build/iPhoneMirror-mac.zip
