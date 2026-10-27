@@ -5,6 +5,8 @@ import Foundation
 /// Kiểm tra nhanh phần không cần mạng: tách H.264, dựng định dạng từ SPS/PPS thật của NVENC, keymap.
 enum SelfTest {
     static func run() -> Never {
+        setvbuf(stdout, nil, _IONBF, 0)  // in ngay từng dòng: app có văng thì log CI vẫn thấy tới bước nào
+        print("self-test: bắt đầu")
         var failed = 0
         func check(_ ok: Bool, _ what: String, line: Int = #line) {
             if !ok { failed += 1; print("SELF-TEST LỖI dòng \(line): \(what)") }
@@ -50,6 +52,7 @@ enum SelfTest {
         }
         check(VideoRenderer.split(hp, from: 1, hevc: false).params == nil, "gói HEVC không bị đọc nhầm thành H.264")
 
+        print("self-test: xong phần hình")
         // Keymap: đọc đúng file của PC, tin nhắn lưu có "data" ở cuối
         let json = #"[{"label":"Nhảy","keys":"SPACE","x":0.5,"y":0.25}]"#
         let km = try? JSONDecoder().decode([KeyButton].self, from: Data(json.utf8))
@@ -97,6 +100,7 @@ enum SelfTest {
               && !KeyButton.validKeys("LSHIFTT") && !KeyButton.validKeys("F25") && !KeyButton.validKeys("Đ") && !KeyButton.validKeys(""),
               "tên phím")
         check(KeyProfile.presets.count >= 15 && Set(KeyProfile.presets.map(\.name)).count == KeyProfile.presets.count, "đủ mẫu, không trùng tên")
+        print("self-test: xong keymap, kiểm bố cục \(KeyProfile.presets.count) mẫu")
         // Mỗi mẫu: phím PC hiểu được; nút không chồng nhau, không nằm dưới thanh công cụ, không lòi ra ngoài (iPhone 11 Pro Max nằm ngang)
         let screen = CGRect(x: 0, y: 0, width: 896, height: 414), bar = CGRect(x: 448 - 165, y: 0, width: 330, height: 48)
         for p in KeyProfile.presets {
@@ -115,6 +119,7 @@ enum SelfTest {
             }
         }
 
+        print("self-test: xong bố cục")
         // Mã QR trên PC: địa chỉ thiếu cổng thì thêm 8443, chứng chỉ ghi sẵn để khỏi hỏi tin
         let qr = URL(string: "remotedesk://pair?n=DESKTOP-1&a=192.168.0.103,14.162.162.13:9000&c=0123abcd&f=AABB")!
         let pr = SavedHost.pair(qr)
@@ -124,6 +129,7 @@ enum SelfTest {
               "mã QR thiếu mã hoặc sai loại")
 
         print(failed == 0 ? "self-test OK" : "self-test LỖI: \(failed)")
+        usleep(300_000)  // cho simctl --console kịp đọc dòng cuối trước khi app thoát
         exit(failed == 0 ? 0 : 1)
     }
 }
