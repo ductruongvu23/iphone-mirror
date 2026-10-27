@@ -7,9 +7,23 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 rm -rf build
+mkdir -p build
+
+# xcodebuild; lỗi thì in các dòng error ra chú thích và phần tóm tắt của GitHub Actions
+# (xem được trên trang Actions mà không cần đăng nhập, khác với log đầy đủ).
+xcb() {
+  if xcodebuild "$@" > build/xcodebuild.log 2>&1; then return 0; fi
+  grep -E "error:" build/xcodebuild.log | sed "s|$PWD/||" | sort -u > build/errors.txt || true
+  head -10 build/errors.txt | while IFS= read -r l; do echo "::error::$l"; done
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    { echo '### Lỗi biên dịch'; echo '```'; head -80 build/errors.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+  fi
+  tail -40 build/xcodebuild.log
+  return 1
+}
 
 if [ "${1:-}" = "--test" ]; then
-  xcodebuild -quiet -project RemoteDesk.xcodeproj -target RemoteDesk -configuration Debug -sdk iphonesimulator \
+  xcb -quiet -project RemoteDesk.xcodeproj -target RemoteDesk -configuration Debug -sdk iphonesimulator \
     SYMROOT="$PWD/build" CODE_SIGNING_ALLOWED=NO build
   UDID=$(xcrun simctl list devices available -j | python3 -c 'import json, sys
 d = json.load(sys.stdin)["devices"]
@@ -21,7 +35,7 @@ print(next(x["udid"] for r in d if "iOS" in r for x in d[r] if "iPhone" in x["na
   exit
 fi
 
-xcodebuild -quiet -project RemoteDesk.xcodeproj -target RemoteDesk -configuration Release -sdk iphoneos \
+xcb -quiet -project RemoteDesk.xcodeproj -target RemoteDesk -configuration Release -sdk iphoneos \
   SYMROOT="$PWD/build" CODE_SIGNING_ALLOWED=NO build
 mkdir -p build/ipa/Payload
 cp -R build/Release-iphoneos/RemoteDesk.app build/ipa/Payload/
