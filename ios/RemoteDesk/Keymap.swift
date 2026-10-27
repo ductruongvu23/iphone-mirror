@@ -134,9 +134,9 @@ extension KeyProfile {
     /// Xbox Cloud Gaming). Phím theo mặc định trên PC của từng game.
     static let presets: [KeyProfile] = [
         KeyProfile(name: "Máy tính", touch: .trackpad, keys: [
-            .init(label: "Esc", keys: "ESC", x: 0.06, y: 0.2), .init(label: "Tab", keys: "TAB", x: 0.06, y: 0.32),
-            .init(label: "Win", keys: "WIN", x: 0.06, y: 0.44), .init(label: "Alt+Tab", keys: "ALT+TAB", x: 0.94, y: 0.2),
-            .init(label: "Copy", keys: "CTRL+C", x: 0.94, y: 0.32), .init(label: "Paste", keys: "CTRL+V", x: 0.94, y: 0.44),
+            .init(label: "Esc", keys: "ESC", x: 0.06, y: 0.18), .init(label: "Tab", keys: "TAB", x: 0.06, y: 0.32),
+            .init(label: "Win", keys: "WIN", x: 0.06, y: 0.46), .init(label: "Alt+Tab", keys: "ALT+TAB", x: 0.94, y: 0.18),
+            .init(label: "Copy", keys: "CTRL+C", x: 0.94, y: 0.32), .init(label: "Paste", keys: "CTRL+V", x: 0.94, y: 0.46),
             .init(label: "Trái", keys: "LMB", x: 0.86, y: 0.7), .init(label: "Phải", keys: "RMB", x: 0.94, y: 0.82),
             .init(label: "Enter", keys: "ENTER", x: 0.78, y: 0.86),
         ], preset: "Máy tính"),
