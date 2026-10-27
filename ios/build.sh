@@ -31,7 +31,10 @@ print(next(x["udid"] for r in d if "iOS" in r for x in d[r] if "iPhone" in x["na
   xcrun simctl boot "$UDID" 2>/dev/null || true
   xcrun simctl install "$UDID" build/Debug-iphonesimulator/RemoteDesk.app
   xcrun simctl launch --console "$UDID" vn.vdt.remotedesk --self-test | tee build/selftest.log
-  grep -q "self-test OK" build/selftest.log
+  if ! grep -q "self-test OK" build/selftest.log; then  # in các dòng lỗi (hoặc cuối log nếu app văng) ra chú thích
+    { grep "SELF-TEST" build/selftest.log || tail -15 build/selftest.log; } | head -30 | while IFS= read -r l; do echo "::error::$l"; done
+    exit 1
+  fi
   exit
 fi
 
