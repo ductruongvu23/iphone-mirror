@@ -10,7 +10,7 @@ struct ContentView: View {
     @State private var askLogin = false
     @State private var adding = false
     @State private var user = ""
-    @State private var pass = "
+    @State private var pass = ""
     @State private var address = ""
     @State private var resolving: String?
     @State private var error: String?
