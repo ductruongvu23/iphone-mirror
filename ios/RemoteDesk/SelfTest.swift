@@ -1,4 +1,5 @@
 import CoreMedia
+import UIKit
 import Foundation
 
 /// Kiểm tra nhanh phần không cần mạng: tách H.264, dựng định dạng từ SPS/PPS thật của NVENC, keymap.
@@ -74,7 +75,8 @@ enum SelfTest {
         check(out.candidates(onWiFi: false).first == "14.162.162.13:8443" && out.candidates(onWiFi: true).last == "14.162.162.13:8443",
               "IP công khai: 4G thử trước, Wi‑Fi thử sau cùng")
         check(SavedHost.kind("172.20.10.2:8443") == .lan && SavedHost.kind("14.162.162.13:8443") == .internet
-              && SavedHost.kind("my-pc.local:8443") == .lan, "phân loại địa chỉ")
+              && SavedHost.kind("my-pc.local:8443") == .lan && SavedHost.kind("Nha.DuckDNS.org:8443") == .internet
+              && SavedHost.kind("mypc:8443") == .lan, "phân loại địa chỉ")
 
         // Cần di chuyển: vùng chết, 8 hướng, đẩy hết cỡ thì thêm phím chạy
         let wasd = "W,A,S,D"
@@ -91,6 +93,35 @@ enum SelfTest {
         check(!sticks.isEmpty && sticks.allSatisfy { $0.keys.split(separator: ",").count == 4 }, "mẫu: cần di chuyển đủ 4 phím")
         let round = (try? JSONEncoder().encode(KeyProfile.presets)).flatMap { try? JSONDecoder().decode([KeyProfile].self, from: $0) }
         check(round?.map(\.name) == KeyProfile.presets.map(\.name) && round?[1].touch == .look, "lưu/đọc hồ sơ")
+        check(KeyButton.validKeys("CTRL+SHIFT+ESC") && KeyButton.validKeys("f5") && KeyButton.validKeys("WHEELUP")
+              && !KeyButton.validKeys("LSHIFTT") && !KeyButton.validKeys("F25") && !KeyButton.validKeys("Đ") && !KeyButton.validKeys(""),
+              "tên phím")
+        check(KeyProfile.presets.count >= 15 && Set(KeyProfile.presets.map(\.name)).count == KeyProfile.presets.count, "đủ mẫu, không trùng tên")
+        // Mỗi mẫu: phím PC hiểu được; nút không chồng nhau, không nằm dưới thanh công cụ, không lòi ra ngoài (iPhone 11 Pro Max nằm ngang)
+        let screen = CGRect(x: 0, y: 0, width: 896, height: 414), bar = CGRect(x: 448 - 165, y: 0, width: 330, height: 48)
+        for p in KeyProfile.presets {
+            for k in p.keys where !k.isValid { check(false, "\(p.name): phím \"\(k.keys)\" của nút \(k.label)") }
+            let rects = p.keys.filter { !$0.isStick }.map { k -> CGRect in
+                let c = KeyCap(k).bounds.size
+                return CGRect(x: k.x * screen.width - c.width / 2, y: k.y * screen.height - c.height / 2, width: c.width, height: c.height)
+            }
+            for i in rects.indices {
+                let name = p.keys.filter { !$0.isStick }[i].label
+                check(screen.contains(rects[i]), "\(p.name): nút \(name) lòi ra ngoài màn hình")
+                check(!rects[i].intersects(bar), "\(p.name): nút \(name) nằm dưới thanh công cụ")
+                for j in rects.indices where j > i && rects[i].insetBy(dx: -3, dy: -3).intersects(rects[j]) {
+                    check(false, "\(p.name): nút \(name) chồng lên \(p.keys.filter { !$0.isStick }[j].label)")
+                }
+            }
+        }
+
+        // Mã QR trên PC: địa chỉ thiếu cổng thì thêm 8443, chứng chỉ ghi sẵn để khỏi hỏi tin
+        let qr = URL(string: "remotedesk://pair?n=DESKTOP-1&a=192.168.0.103,14.162.162.13:9000&c=0123abcd&f=AABB")!
+        let pr = SavedHost.pair(qr)
+        check(pr?.host.address == "192.168.0.103:8443" && pr?.host.addresses == ["192.168.0.103:8443", "14.162.162.13:9000"]
+              && pr?.code == "0123abcd" && pr?.host.certHash == "aabb" && pr?.host.name == "DESKTOP-1", "đọc mã QR")
+        check(SavedHost.pair(URL(string: "remotedesk://pair?a=1.2.3.4")!) == nil && SavedHost.pair(URL(string: "https://x/pair?a=1&c=2")!) == nil,
+              "mã QR thiếu mã hoặc sai loại")
 
         print(failed == 0 ? "self-test OK" : "self-test LỖI: \(failed)")
         exit(failed == 0 ? 0 : 1)

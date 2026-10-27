@@ -20,3 +20,6 @@ remote_settings.ini
 remote_keymap.json
 # Bản sao lưu tạm
 *_before_diag.py
+
+# Quyền Claude Code riêng trên máy này
+.claude/settings.local.json
