@@ -87,3 +87,57 @@ Clone vào một **đường dẫn ngắn** (ví dụ `%TEMP%\ap`), vì đườn
   - Đã phát thật 1242×2688, khoảng 56 khung/giây qua Wi‑Fi. Góc video bo khớp khung iPhone.
 - 2026-10-19 Claude: tối ưu hiệu năng. Luồng chính dùng lại PhotoImage, dán video qua mặt nạ, vẽ giao diện ở luồng nền và chỉ khi trạng thái đổi; ~8 ms/khung còn ~4 ms, đo được ~57 khung/giây với CPU thấp hơn hẳn. Sửa lỗi luồng hình tự ngắt khi iPhone đứng yên 5 giây (bỏ timeout 5 s ở _video_worker).
 - 2026-10-19 Claude: bản Mac ở mac/ (SwiftUI, hình qua cáp bằng CoreMediaIO + AVCaptureVideoPreviewLayer, tiếng bằng AVCaptureAudioPreviewOutput, kính .glassEffect trên macOS 26). Build universal arm64+x86_64 bằng GitHub Actions (.github/workflows/mac.yml, Swift 6.2.4) đạt. Repo riêng tư: https://github.com/ductruongvu23/iphone-mirror. CHƯA chạy thử trên máy Mac thật. Chưa có chuột BLE trên Mac.
+- 2026-10-20 Claude: remote desktop kiểu Moonlight, viết bằng C++ thuần Win32 (`remote_host.cpp` → `remote_host.exe`, lệnh build ở đầu file).
+  - PC: chụp bằng DXGI Desktop Duplication (màn hình chính, có vẽ con trỏ) → NV12 → H.264 qua Media Foundation (NVIDIA H.264 Encoder MFT, thiếu thì dùng bản phần mềm), CBR, độ trễ thấp, IDR khi client xin. HTTPS/WSS qua Schannel với chứng chỉ tự ký trong kho CurrentUser\My, PIN 8 số trong remote_pin.txt, SendInput.
+  - iPhone: trang `remote_desktop.html` (Safari, WebCodecs, mở https://IP:8443). Có trackpad/chạm trực tiếp, bàn phím iOS, keymap kéo thả lưu ở remote_keymap.json.
+  - `--self-test` đạt. Thử đầu cuối qua localhost bằng client Python cũng đạt (nhận hình NVENC 1920×1200, PIN, keymap, đá client cũ). CHƯA thử trên iPhone thật: cần cài và tin cậy chứng chỉ, và cho phép qua firewall.
+- 2026-10-21 Claude: thêm giao diện cho cả hai phía.
+  - Windows: `remote_host.exe` giờ là app có cửa sổ (Win32, icon + manifest PerMonitorV2, build bằng `bash build_host.sh`). Cửa sổ hiện trạng thái (IP iPhone, khung/s, Mbps, encoder), PIN lớn kèm nút Đổi PIN và Ngắt kết nối, địa chỉ cho Safari, chọn độ phân giải/fps/bitrate (lưu remote_settings.ini, đổi là phát lại ngay không cần nối lại), và nhật ký. Quảng bá mDNS `_remotedesk._tcp` bằng DnsServiceRegister. Mã đóng 4001 = PC ngắt. Self-test và thử đầu cuối đều đạt.
+  - iPhone: app SwiftUI gốc ở `ios/` (project Xcode 16, thư mục đồng bộ, iOS 17+, bundle vn.vdt.remotedesk).
+    - Tự tìm PC qua mDNS, lưu PC/PIN, tin chứng chỉ lần đầu (pin SHA-256).
+    - Giải mã phần cứng bằng AVSampleBufferDisplayLayer giống Moonlight.
+    - Trackpad/chạm trực tiếp, đa chạm, keymap kéo thả + sheet sửa nút, bàn phím iOS, kính lỏng iOS 26.
+    - `bash ios/build.sh` ra IPA chưa ký (ký bằng Sideloadly); `--test` chạy self-test trên Simulator; có workflow `.github/workflows/ios.yml`.
+    - CHƯA biên dịch lần nào (máy này không có Swift): cần Mac hoặc chạy CI.
+- 2026-10-21 Claude: app iPhone thêm bảng Cài đặt (nút bánh răng).
+  - Bật/tắt nút keymap, độ mờ nút 0–90%, khôi phục keymap mặc định.
+  - Kiểu điều khiển, độ nhạy chuột 0.5–6×.
+  - Bật/tắt dải thông số: chấm màu theo ping, khung/s, ping, Mbps, độ phân giải, Wi‑Fi hay hotspot/cáp; trong bảng còn có địa chỉ PC và bộ mã hoá.
+  - Lưu trong UserDefaults. Vẫn CHƯA biên dịch (cần Mac hoặc CI).
+- 2026-10-23 Claude: control_panel/liquid_glass: khung iPhone tự xoay ngang khi iPhone gửi hình ngang (GlassUI landscape=True, dựng lại nền khi đổi hướng). Self-test đạt, đã thấy hình ngang 2688×1242 đúng tỉ lệ.
+- 2026-10-27 Claude: đổi giao diện remote desktop sang phong cách Apple "white gallery" (bản hướng dẫn người dùng đưa), có bản tối.
+  - Windows `remote_host.exe`: nền trắng + dải #f5f5f7, thẻ bo 28 vẽ bằng GDI+, chữ Segoe UI Variable thay SF Pro.
+    - PIN 56px ở giữa như "sản phẩm", nhãn cam "TRỰC TIẾP" khi đang phát.
+    - Nút pill viền mảnh; phân đoạn kiểu Apple thay combobox. Nút owner-draw nên vẫn dùng được Tab/Space.
+    - Theo App mode của Windows và tự đổi khi người dùng đổi; ép bằng `--theme light|dark`. Thanh tiêu đề cùng màu nền (DWM).
+    - Đã chụp kiểm tra sáng, tối và lúc đang phát. Self-test đạt.
+  - iPhone: Theme.swift (token tự đổi sáng/tối), màn hình đầu kiểu sân khấu trắng + thẻ PC bo 28 với nút xanh "Kết nối", thanh công cụ/nút keymap/dải thông số dạng rãnh mờ rgba(210,210,215,.64), thẻ trạng thái trắng, Form nền #f5f5f7. Bỏ kính lỏng và ép tối. Vẫn CHƯA biên dịch.
+  - remote_desktop.html: cùng token, có prefers-color-scheme dark.
+- 2026-10-27 Claude: tối ưu keymap cho game (dựa trên hướng dẫn touch của Xbox Cloud Gaming, BlueStacks, lỗi SendInput với DirectInput).
+  - PC: phím gửi bằng scan code (KEYEVENTF_SCANCODE) cho game DirectInput/raw input; mũi tên/Home/Del luôn có cờ extended (thiếu thì thành phím số). Self-test thêm kiểm tra W = 0x11.
+  - iPhone:
+    - Hồ sơ keymap theo game, lưu trên iPhone; mẫu Máy tính / Bắn súng (FPS) / Đua xe / MOBA / Hành động 2D.
+    - Cần di chuyển 8 hướng: vùng chết 25%, cần nổi hoặc cố định, đẩy quá 90% thì thêm phím chạy.
+    - Nút giữ / bật-tắt / liên thanh 15 lần/giây, "kéo trên nút để xoay camera" (bắn + ngắm), kích thước từng nút.
+    - Chạm vào nền: trackpad / chuột trái / chuột phải (MOBA) / vuốt xoay camera (độ nhạy riêng).
+    - Ngắm bằng con quay: tắt / luôn bật / khi ngắm, có đảo trục dọc. Sửa keymap bám lưới 1%.
+    - Trang Safari bỏ qua cần di chuyển. Self-test Swift thêm cần/hồ sơ. Vẫn CHƯA biên dịch.
+- 2026-10-27 Claude: tối ưu mạng cho dùng ở ngoài.
+  - PC: bộ đệm gửi TCP cố định 256 KB (Windows tự nới tới vài MB làm hình dồn trễ hàng giây khi mạng chậm). Bitrate tự điều chỉnh mỗi giây theo thời gian bị kẹt khi gửi: kẹt >50% thì −30%, thoáng 2 s thì +20%, tối đa bằng mức người dùng chọn. Đã thử với client chậm giả lập: 20→14→9→6→4→2 rồi nâng lại; NVENC MFT cho đổi bitrate khi đang phát.
+  - hello gửi kèm "addrs" (LAN trước, Tailscale 100.64/10 sau). Cửa sổ PC ghi rõ địa chỉ nào là Tailscale và báo "(tự hạ còn N)".
+  - iPhone: lưu mọi địa chỉ PC, thử lần lượt (Wi‑Fi thì LAN trước, 4G thì Tailscale trước, chờ 4 s mỗi địa chỉ). Chứng chỉ lạ ở địa chỉ chưa phải cuối thì bỏ qua, không hỏi. Nhãn mạng "Tailscale (ở ngoài)".
+  - Tailscale đã có trên PC (desktop-v3rtjok, 100.99.115.103). netcheck: NAT dễ, có UPnP, relay gần nhất Singapore ~50 ms. iPhone 11 Pro Max chưa có trong tailnet (chỉ có iphone-xs-max offline 87 ngày).
+- 2026-10-27 Claude: HEVC và kết nối thẳng từ ngoài, không qua Tailscale.
+  - HEVC: NVIDIA HEVC Encoder MFT. Client báo `"hevc":true` thì phát HEVC, không thì H.264. Byte cờ gói hình: bit 0 khoá, bit 1 HEVC. Cửa sổ PC có phân đoạn Mã hoá H.264/HEVC. iOS dùng CMVideoFormatDescriptionCreateFromHEVCParameterSets; Safari dựng chuỗi hvc1 từ SPS (đã kiểm: hvc1.1.6.H123.90). Đầu cuối localhost đạt (VPS/SPS/PPS/IDR).
+  - Ghép đôi: PIN chỉ nhận từ địa chỉ riêng (LAN/hotspot/Tailscale). Lần đầu PC cấp khoá thiết bị 256-bit (remote_devices.txt lưu SHA-256; iPhone lưu Keychain; Safari lưu localStorage). Từ Internet chỉ khoá được vào ("needpair" nếu dùng PIN). Sai 5 lần thì khoá IP 5 phút, gấp đôi mỗi lần, tối đa 1 ngày. Nút "Quên thiết bị".
+  - Từ Internet: tự viết UPnP IGD (SSDP + SOAP AddPortMapping, gia hạn 20 phút, đóng cổng khi tắt app). Bật bằng phân đoạn "Từ Internet" (mặc định Tắt). IP công khai hỏi Cloudflare 1.1.1.1/cdn-cgi/trace (chỉ để biết địa chỉ). PC tự thử nối vào IP công khai để biết đã thông chưa. `remote_host.exe --upnp-check` chỉ đọc router.
+  - Mạng nhà có 2 lớp router: modem VNPT 192.168.1.1 (IP công khai 14.162.162.13, không có UPnP, chỉ mở cổng 80) → AC750 192.168.1.2 (có UPnP) → PC 192.168.0.103. Người dùng phải tự chuyển cổng TCP 8443 trên modem về 192.168.1.2 (hoặc DMZ 192.168.1.2). CHƯA bật thử mở cổng (cần người dùng đồng ý). iOS/Safari CHƯA chạy thật.
+- 2026-10-27 Claude: bỏ PIN, đăng nhập bằng tài khoản do PC (máy chủ) quản lý.
+  - remote_account.txt: tên, muối hex, 600000, PBKDF2-HMAC-SHA256 hex (BCryptDeriveKeyPBKDF2; Python hashlib cùng định dạng). Tên so không phân biệt hoa thường; mật khẩu ≥ 8 ký tự.
+  - Tin đăng nhập `{"user","pass","token","hevc"}`. Đúng thì cấp khoá thiết bị như trước. Trả lời: badlogin / noaccount / locked.
+  - Chống dò: khoá theo IP như trước, thêm khoá toàn cục: 20 lần sai từ Internet trong 10 phút thì 10 phút không nhận mật khẩu từ Internet.
+  - Đổi tài khoản thì thu hồi mọi khoá và đá phiên đang chạy.
+  - Cửa sổ PC: tên tài khoản ở chỗ PIN cũ, nút "Tạo/Đổi tài khoản". Hộp tạo tài khoản kiểu Apple (ô nhập viên bo tròn, nút xanh), tự mở lần đầu. "Quên thiết bị" đổi thành "Đăng xuất hết".
+  - iOS: alert Đăng nhập (tên + SecureField), có khoá thì vào thẳng, badlogin xoá khoá. Safari: form đăng nhập trong #help.
+  - Self-test (vector PBKDF2 chuẩn, tạo/đọc/kiểm tài khoản, khoá toàn cục) và thử đầu cuối (noaccount, đúng/sai, khoá, khoá IP) đều đạt. iOS/Safari CHƯA chạy thật.
+  - Đang mở trên màn hình trái (DISPLAY1, x âm) bằng STARTF_USEPOSITION vì người dùng chơi game ở màn chính. Chụp kiểm tra thì dùng PrintWindow ngoài màn hình, không SetForegroundWindow (hộp thoại từng nhận 2 phím lúc người dùng đang chơi game).
