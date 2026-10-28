@@ -150,4 +150,4 @@ Clone vào một **đường dẫn ngắn** (ví dụ `%TEMP%\ap`), vì đườn
   - Lớp phủ: thông số Ẩn/Gọn/Đủ, độ mờ thanh công cụ + thông số, thu gọn thanh công cụ còn một nút; dải thông số không chặn chạm.
   - Self-test Swift thêm kiểm mỗi mẫu: phím hợp lệ, nút không chồng nhau/không nằm dưới thanh công cụ/không lòi khỏi màn 896×414. Self-test PC đạt; CI iOS đạt (run 40574100819, IPA ở artifact). iOS CHƯA chạy trên máy thật.
   - CI: self-test in không đệm + chờ 0,3 s trước exit (simctl --console từng mất dòng cuối); build.sh in lỗi self-test và báo cáo crash Simulator ra chú thích.
-  - CHƯA phát hành v1.1.0: commit xuất cho repo remote-desk đã dựng ở ref cục bộ `remote-desk-export` (dc0b9bf), chưa đẩy, chưa gắn tag (cần người dùng đồng ý đăng công khai).
+  - Đã phát hành v1.1.0 (người dùng đồng ý): https://github.com/ductruongvu23/remote-desk/releases/tag/v1.1.0 (IPA 914 KB, zip PC 919 KB), tải về C:\Users\VDT\Downloads vì lúc đó không có ổ D.
