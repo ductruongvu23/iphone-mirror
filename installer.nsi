@@ -1,7 +1,8 @@
-; Bộ cài Remote Desk cho PC (NSIS 3, gói mingw-w64-ucrt-x86_64-nsis của MSYS2).
+﻿; Bộ cài Remote Desk cho PC (NSIS 3, gói mingw-w64-ucrt-x86_64-nsis của MSYS2).
 ;   bash build_host.sh && makensis -DVERSION=1.1.0 installer.nsi   ->  RemoteDesk-Setup-1.1.0.exe
 ; Cài cho người dùng hiện tại, không cần quyền quản trị, vào %LOCALAPPDATA%\Programs\Remote Desk:
 ; app ghi tài khoản, khoá thiết bị và cài đặt cạnh file exe nên không cài vào Program Files (chỉ đọc).
+; File phải lưu UTF-8 có BOM: không có BOM thì makensis đọc theo bảng mã ANSI, chữ tiếng Việt vỡ.
 Unicode true
 !include MUI2.nsh
 
@@ -24,6 +25,7 @@ BrandingText "${APP} ${VERSION}"
 !define MUI_ICON "icons\app_icon.ico"
 !define MUI_UNICON "icons\app_icon.ico"
 !define MUI_ABORTWARNING
+!define MUI_COMPONENTSPAGE_NODESC
 !define MUI_FINISHPAGE_RUN "$INSTDIR\remote_host.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Mở Remote Desk"
 !insertmacro MUI_PAGE_COMPONENTS
