@@ -11,6 +11,7 @@ devimages/
 WDA.ipa
 *.dll
 remote_host.exe
+RemoteDesk-Setup-*.exe
 # Rác khi chạy
 *.log
 __pycache__/
