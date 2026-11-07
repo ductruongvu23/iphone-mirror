@@ -171,6 +171,12 @@ enum StatsStyle: String, CaseIterable {
     }
 }
 
+/// Chất lượng hình PC đang phát (đổi được từ bảng điều khiển trên iPhone). width 0 = độ phân giải gốc.
+struct StreamQuality: Equatable {
+    var width = 1920, fps = 60, mbps = 20
+    var hevc = true
+}
+
 /// Thông số hiện trên màn hình điều khiển.
 struct LinkStats: Equatable {
     var fps = 0, ping = 0
@@ -213,7 +219,8 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
     @Published var sensitivity = Session.pref("sensitivity", 2.2) { didSet { UserDefaults.standard.set(sensitivity, forKey: "sensitivity") } }
     @Published var stats = StatsStyle(rawValue: Session.pref("stats", "full")) ?? .full { didSet { UserDefaults.standard.set(stats.rawValue, forKey: "stats") } }
     @Published var barFade = Session.pref("barFade", 0.0) { didSet { UserDefaults.standard.set(barFade, forKey: "barFade") } }  // độ mờ thanh công cụ + thông số
-    @Published var barCollapsed = Session.pref("barCollapsed", false) { didSet { UserDefaults.standard.set(barCollapsed, forKey: "barCollapsed") } }
+    @Published var quality = StreamQuality()  // PC báo lại mỗi giây trong pong
+    private var qualityHold = 0.0
     @Published var lookSens = Session.pref("lookSens", 1.5) { didSet { UserDefaults.standard.set(lookSens, forKey: "lookSens") } }
     @Published var gyro = GyroMode(rawValue: Session.pref("gyro", "off")) ?? .off { didSet { UserDefaults.standard.set(gyro.rawValue, forKey: "gyro") } }
     @Published var gyroSens = Session.pref("gyroSens", 1.0) { didSet { UserDefaults.standard.set(gyroSens, forKey: "gyroSens") } }
@@ -339,6 +346,17 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
         (t ?? task)?.send(.string(text)) { _ in }
     }
 
+    /// Đổi chất lượng hình trên PC (chỉ gửi mục đổi); PC áp dụng, lưu và phát lại ngay như bấm trên cửa sổ PC.
+    func setQuality(width: Int? = nil, fps: Int? = nil, mbps: Int? = nil, hevc: Bool? = nil) {
+        var m: [String: Any] = ["t": "quality"]
+        if let width { quality.width = width; m["w"] = width }
+        if let fps { quality.fps = fps; m["fps"] = fps }
+        if let mbps { quality.mbps = mbps; m["mbps"] = mbps }
+        if let hevc { quality.hevc = hevc; m["hevc"] = hevc ? 1 : 0 }
+        qualityHold = CACurrentMediaTime() + 2.5  // pong cũ còn trên đường về thì đừng nhảy ngược lựa chọn
+        send(m)
+    }
+
     func tapKey(_ keys: String) {
         send(["t": "k", "keys": keys, "d": 1])
         send(["t": "k", "keys": keys, "d": 0])
@@ -410,7 +428,7 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
         guard let d = s.data(using: .utf8), let m = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
               let type = m["t"] as? String else { return }
         let c = m["c"] as? Double, e = m["enc"] as? String, sz = m["size"] as? [Int], addrs = m["addrs"] as? [String]
-        let fileID = m["id"] as? String, fileName = m["name"] as? String
+        let fileID = m["id"] as? String, fileName = m["name"] as? String, q = m["q"] as? [Int]
         if type == "hello", let tok = m["token"] as? String, tok.count == 64 { Keychain.set(host.address, tok) }  // vừa đăng nhập
         if type == "badlogin" { Keychain.delete(host.address) }  // khoá cũ bị thu hồi (PC đổi tài khoản / đăng xuất hết)
         DispatchQueue.main.async { [self] in
@@ -439,6 +457,10 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
                 if let c { link.ping = Int(CACurrentMediaTime() * 1000 - c) }
                 link.enc = e ?? ""
                 if let sz, sz.count == 2 { link.size = "\(sz[0])×\(sz[1])" }
+                if let q, q.count == 4, CACurrentMediaTime() > qualityHold {
+                    let now = StreamQuality(width: q[0], fps: q[1], mbps: q[2], hevc: q[3] != 0)
+                    if now != quality { quality = now }
+                }
             default: break
             }
         }

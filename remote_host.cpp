@@ -57,6 +57,7 @@ using std::string;
 using Clock = std::chrono::steady_clock;
 
 static std::atomic<int> g_fps{60}, g_mbps{20}, g_width{1920};
+static const int RES_W[] = {1280, 1920, 2560, 0}, FPS_V[] = {30, 60, 90, 120}, RATE_V[] = {5, 10, 20, 30, 50};  // 0 = độ phân giải gốc
 static int g_port = 8443;
 static std::atomic<bool> g_hevc{true}, g_remote{false};  // mã hoá HEVC; cho vào từ Internet (mở cổng router)
 static std::wstring g_dir;  // thư mục chứa exe
@@ -66,6 +67,7 @@ static HWND g_hwnd;  // cửa sổ chính (null khi self-test)
 static std::mutex g_logmu;
 static std::vector<string> g_logq;
 #define WM_APP_LOG (WM_APP + 1)
+#define WM_APP_SET (WM_APP + 2)  // iPhone đổi chất lượng: wParam nhóm (0 độ phân giải, 1 fps, 2 bitrate, 3 mã hoá), lParam vị trí
 
 static void logf(const char* fmt, ...) {
     char b[512];
@@ -1943,7 +1945,20 @@ struct Session {
                 size_t p = jfind(m, "c"), q = p == string::npos ? p : m.find_first_not_of("-0123456789.eE+", p);
                 std::lock_guard g(info_mu);
                 ws_send(t, 1, R"({"t":"pong","c":)" + (p == string::npos ? string("0") : m.substr(p, q - p)) + R"(,"enc":")" +
-                                  jesc(enc_name) + R"(","size":[)" + std::to_string(vw) + "," + std::to_string(vh) + "]}");
+                                  jesc(enc_name) + R"(","size":[)" + std::to_string(vw) + "," + std::to_string(vh) + R"(],"q":[)" +
+                                  std::to_string(g_width) + "," + std::to_string(g_fps) + "," + std::to_string(g_mbps) + "," +
+                                  (g_hevc ? "1" : "0") + "]}");
+            } else if (ty == "quality") {  // iPhone đổi chất lượng: chỉ nhận đúng các mức có trên cửa sổ PC
+                const int* tab[] = {RES_W, FPS_V, RATE_V};
+                const int cnt[] = {4, 4, 5};
+                const char* key[] = {"w", "fps", "mbps", "hevc"};
+                for (int grp = 0; grp < 4; grp++) {
+                    double v;
+                    if (!jnum(m, key[grp], v)) continue;
+                    int idx = grp == 3 ? (v != 0) : -1;
+                    for (int i = 0; grp < 3 && i < cnt[grp]; i++) if (tab[grp][i] == (int)v) idx = i;
+                    if (idx >= 0 && g_hwnd) PostMessageW(g_hwnd, WM_APP_SET, grp, idx);  // áp dụng, lưu, phát lại ở luồng giao diện
+                }
             } else if (ty == "keymap") {
                 size_t p = jfind(m, "data");
                 string d = p == string::npos ? "" : m.substr(p, m.size() - p - 1);
@@ -2096,7 +2111,6 @@ static bool setup_tls(const std::wstring& cn, bool& created) {
 // Nền trắng/#f5f5f7, chữ Ink, thẻ bo 28 px không bóng, nút pill viền mảnh, phân đoạn kiểu Apple.
 // Theo chế độ sáng/tối của Windows (App mode) và tự đổi khi người dùng đổi.
 enum { ID_ACCOUNT = 101, ID_KICK, ID_FORGET, ID_ACC_SAVE, ID_ACC_CANCEL, ID_PAIR, ID_DDNS, ID_SEND, ID_RECVDIR, ID_UPDATE, ID_ACC_EDIT = 120, ID_SEG = 200 };  // phân đoạn: ID_SEG + nhóm*10 + vị trí
-static const int RES_W[] = {1280, 1920, 2560, 0}, FPS_V[] = {30, 60, 90, 120}, RATE_V[] = {5, 10, 20, 30, 50};
 static DNS_SERVICE_REGISTER_REQUEST g_reg{};
 
 static std::wstring wide(const string& s) {
@@ -2701,6 +2715,7 @@ static std::vector<std::wstring> pick_files() {
 static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_APP_LOG: append_logs(); return 0;
+    case WM_APP_SET: apply_setting((int)wp, (int)lp); return 0;
     case WM_TIMER: refresh_status(); return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: paint(h); return 0;
