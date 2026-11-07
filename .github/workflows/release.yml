@@ -19,7 +19,9 @@ jobs:
       - name: Self-test trên iOS Simulator
         run: bash ios/build.sh --test
       - name: Build IPA chưa ký
-        run: VERSION=${GITHUB_REF_NAME#v} bash ios/build.sh
+        run: |  # iOS chỉ nhận số và dấu chấm: v1.2.0-beta.1 -> 1.2.0
+          V=${GITHUB_REF_NAME#v}
+          VERSION=${V%%-*} bash ios/build.sh
       - uses: actions/upload-artifact@v4
         with:
           name: ios
@@ -97,5 +99,7 @@ jobs:
           3. Muốn dùng ở ngoài: bật "Từ Internet" trên cửa sổ PC (cần mở cổng TCP 8443 trên router/modem). Đặt "Tên miền" (DDNS, ví dụ DuckDNS miễn phí) để IP nhà đổi vẫn vào được, và để thêm PC từ xa khi không quét được mã: nhập tên miền + tài khoản.
           4. Keymap có sẵn cho Minecraft, CS2, Valorant, PUBG, Genshin, Star Rail, ZZZ, Wuthering Waves, Roblox, GTA V, MOBA.
           EOF
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "Remote Desk $TAG" --notes-file notes.md \
+          # tag có dấu "-" (v1.2.0-beta.1) là bản thử: pre-release, không thành "latest" nên app tự cập nhật bỏ qua
+          PRE=$([[ "$TAG" == *-* ]] && echo --prerelease || true)
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "Remote Desk $TAG" --notes-file notes.md $PRE \
             "RemoteDesk-iOS-$TAG-unsigned.ipa" "RemoteDesk-Windows-$TAG-Setup.exe" "RemoteDesk-Windows-$TAG.zip" altstore.json
