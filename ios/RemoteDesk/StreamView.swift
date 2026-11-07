@@ -1,6 +1,5 @@
 import AVFoundation
 import CoreMotion
-import PhotosUI
 import SwiftUI
 import UIKit
 
@@ -476,12 +475,20 @@ struct StreamView: View {
     @State private var showSettings = false
     @State private var pickPhotos = false
     @State private var pickFiles = false
-    @State private var photoItems: [PhotosPickerItem] = []
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
+                .sheet(isPresented: Binding(get: { session.state == .badLogin }, set: { if !$0 && session.state == .badLogin { close() } })) {
+                    LoginSheet(title: "Đăng nhập",
+                               message: "Sai tên hoặc mật khẩu, hoặc PC đã đổi tài khoản. Dùng tài khoản tạo trên cửa sổ Remote Desk ở PC.",
+                               user: $user, pass: $pass) {
+                        session.retry(user: user, password: pass)
+                        pass = ""
+                    } cancel: { close() }
+                }
             StreamCanvas(session: session).ignoresSafeArea()
+                .sheet(isPresented: $pickPhotos) { PhotoPicker { session.send(files: $0) }.ignoresSafeArea() }
             VStack {
                 toolbar.opacity(1 - session.barFade)
                 if let tr = session.transfer {
@@ -500,27 +507,14 @@ struct StreamView: View {
             .padding(.horizontal)
             statusCard
         }
-        .photosPicker(isPresented: $pickPhotos, selection: $photoItems, maxSelectionCount: 20, matching: .any(of: [.images, .videos]))
-        .onChange(of: photoItems) { _, items in
-            guard !items.isEmpty else { return }
-            photoItems = []
-            Task { session.send(files: await Self.stage(items)) }
-        }
         .fileImporter(isPresented: $pickFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { r in
             if case .success(let urls) = r { session.send(files: urls.compactMap { try? Files.stage($0) }) }
         }
         .statusBarHidden()
-        .persistentSystemOverlays(.hidden)
-        .defersSystemGestures(on: .all)
+        .gameScreen()
         .sheet(item: Binding(get: { session.editIndex.map(EditTarget.init) }, set: { session.editIndex = $0?.id })) { t in
             KeyEditor(session: session, index: t.id)
         }
-        .alert("Đăng nhập", isPresented: .constant(session.state == .badLogin)) {
-            TextField("Tên đăng nhập", text: $user).textInputAutocapitalization(.never).autocorrectionDisabled()
-            SecureField("Mật khẩu", text: $pass)
-            Button("Đăng nhập") { session.retry(user: user, password: pass); pass = "" }
-            Button("Đóng", role: .cancel, action: close)
-        } message: { Text("Sai tên hoặc mật khẩu, hoặc PC đã đổi tài khoản. Dùng tài khoản tạo trên cửa sổ Remote Desk ở PC.") }
         .alert("Chứng chỉ của PC đã đổi", isPresented: .constant(session.state == .certChanged)) {
             Button("Tin chứng chỉ mới") { session.trustNewCert() }
             Button("Đóng", role: .cancel, action: close)
@@ -593,23 +587,6 @@ struct StreamView: View {
         .sheet(isPresented: $showSettings) { SettingsSheet(session: session) }
     }
 
-    /// Ảnh, video chọn trong Thư viện ra file tạm để gửi: video nhận thẳng thành file, ảnh giữ định dạng gốc (HEIC, JPEG...).
-    private static func stage(_ items: [PhotosPickerItem]) async -> [URL] {
-        var out: [URL] = []
-        for (i, item) in items.enumerated() {
-            if item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
-                if let m = try? await item.loadTransferable(type: PickedMovie.self) { out.append(m.url) }
-            } else if let d = try? await item.loadTransferable(type: Data.self) {
-                let dir = FileManager.default.temporaryDirectory.appendingPathComponent("send-\(UUID().uuidString)", isDirectory: true)
-                let url = dir.appendingPathComponent(Files.photoName(i, ext: item.supportedContentTypes.first?.preferredFilenameExtension ?? "jpg"))
-                if (try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)) != nil, (try? d.write(to: url)) != nil {
-                    out.append(url)
-                }
-            }
-        }
-        return out
-    }
-
     private func barButton(_ title: String, _ icon: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon).font(.system(size: 15, weight: .semibold)).frame(width: 40, height: 36)
@@ -660,7 +637,7 @@ struct TransferBadge: View {
             } else if !transfer.finished {
                 ProgressView(value: transfer.progress).frame(width: 80)
             } else if let url = transfer.saved {
-                ShareLink(item: url) { Text("Chia sẻ") }
+                Button("Chia sẻ") { Files.share(url) }
             } else {
                 Text("Đã gửi")
             }
@@ -691,7 +668,6 @@ struct LinkBadge: View {
             }
         }
         .font(.text(12, .medium).monospacedDigit())
-        .tracking(-0.12)
         .foregroundStyle(Theme.overlayInk)
         .padding(.horizontal, 14)
         .padding(.vertical, 7)
@@ -706,7 +682,7 @@ struct SettingsSheet: View {
     @State private var confirmDelete = false
 
     var body: some View {
-        NavigationStack {
+        NavigationView {
             Form {
                 Section {
                     Picker("Đang dùng", selection: $session.activeID) {
@@ -731,7 +707,7 @@ struct SettingsSheet: View {
                 Section {
                     Toggle("Hiện nút keymap", isOn: Binding(get: { !session.keysHidden }, set: { session.keysHidden = !$0 }))
                     VStack(alignment: .leading) {
-                        LabeledContent("Độ mờ của nút", value: "\(Int(session.keyFade * 100))%")
+                        LabeledRow("Độ mờ của nút", value: "\(Int(session.keyFade * 100))%")
                         Slider(value: $session.keyFade, in: 0...0.9)
                     }
                     Button("Sửa keymap (kéo để dời, chạm để đổi)") {
@@ -747,7 +723,7 @@ struct SettingsSheet: View {
                     }
                     .pickerStyle(.segmented)
                     VStack(alignment: .leading) {
-                        LabeledContent("Độ mờ thanh công cụ và thông số", value: "\(Int(session.barFade * 100))%")
+                        LabeledRow("Độ mờ thanh công cụ và thông số", value: "\(Int(session.barFade * 100))%")
                         Slider(value: $session.barFade, in: 0...0.9)
                     }
                     Toggle("Thu gọn thanh công cụ", isOn: $session.barCollapsed)
@@ -761,11 +737,11 @@ struct SettingsSheet: View {
                         ForEach(TouchMode.allCases, id: \.self) { Text($0.title).tag($0) }
                     }
                     VStack(alignment: .leading) {
-                        LabeledContent("Độ nhạy trackpad", value: String(format: "%.1f×", session.sensitivity))
+                        LabeledRow("Độ nhạy trackpad", value: String(format: "%.1f×", session.sensitivity))
                         Slider(value: $session.sensitivity, in: 0.5...6, step: 0.1)
                     }
                     VStack(alignment: .leading) {
-                        LabeledContent("Độ nhạy camera", value: String(format: "%.1f×", session.lookSens))
+                        LabeledRow("Độ nhạy camera", value: String(format: "%.1f×", session.lookSens))
                         Slider(value: $session.lookSens, in: 0.3...6, step: 0.1)
                     }
                 } header: { Text("Chuột và camera") } footer: {
@@ -779,7 +755,7 @@ struct SettingsSheet: View {
                     }
                     .pickerStyle(.segmented)
                     VStack(alignment: .leading) {
-                        LabeledContent("Độ nhạy con quay", value: String(format: "%.1f×", session.gyroSens))
+                        LabeledRow("Độ nhạy con quay", value: String(format: "%.1f×", session.gyroSens))
                         Slider(value: $session.gyroSens, in: 0.2...4, step: 0.1)
                     }
                     Toggle("Đảo trục dọc", isOn: $session.gyroInvertY)
@@ -789,21 +765,20 @@ struct SettingsSheet: View {
                 .listRowBackground(Theme.card)
 
                 Section {
-                    LabeledContent("PC", value: session.host.address)
-                    LabeledContent("Mạng", value: session.link.network)
-                    LabeledContent("Ping", value: "\(session.link.ping) ms")
-                    LabeledContent("Khung hình", value: "\(session.link.fps) khung/s")
-                    LabeledContent("Băng thông", value: String(format: "%.1f Mbps", session.link.mbps))
-                    LabeledContent("Độ phân giải", value: session.link.size)
-                    LabeledContent("Bộ mã hoá", value: session.link.enc)
-                    LabeledContent("Phiên bản app", value: AppUpdate.current)
+                    LabeledRow("PC", value: session.host.address)
+                    LabeledRow("Mạng", value: session.link.network)
+                    LabeledRow("Ping", value: "\(session.link.ping) ms")
+                    LabeledRow("Khung hình", value: "\(session.link.fps) khung/s")
+                    LabeledRow("Băng thông", value: String(format: "%.1f Mbps", session.link.mbps))
+                    LabeledRow("Độ phân giải", value: session.link.size)
+                    LabeledRow("Bộ mã hoá", value: session.link.enc)
+                    LabeledRow("Phiên bản app", value: AppUpdate.current)
                 } header: { Text("Kết nối") } footer: {
                     Text("Màn hình PC đứng yên thì khung/s thấp là bình thường. Đổi độ phân giải, fps, bitrate trên cửa sổ PC. File PC gửi xuống nằm trong app Tệp > Trên iPhone > Remote Desk > Nhận từ PC; file gửi lên nằm trong thư mục Tải về" + "\\" + "Remote Desk của PC.")
                 }
                 .listRowBackground(Theme.card)
             }
-            .scrollContentBackground(.hidden)
-            .background(Theme.band)
+            .formBackground(Theme.band)
             .navigationTitle("Cài đặt")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Xong") { dismiss() } } }
@@ -811,8 +786,8 @@ struct SettingsSheet: View {
                 Button("Xoá hồ sơ", role: .destructive) { session.deleteProfile() }
             }
         }
-        .presentationDetents([.medium, .large])
-        .presentationCornerRadius(28)
+        .navigationViewStyle(.stack)
+        .sheetStyle()
     }
 }
 
@@ -848,7 +823,7 @@ struct KeyEditor: View {
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationView {
             Form {
                 Section {
                     Picker("Loại", selection: $kind) {
@@ -898,7 +873,7 @@ struct KeyEditor: View {
 
                 Section {
                     VStack(alignment: .leading) {
-                        LabeledContent("Kích thước", value: "\(Int(size * 100))%")
+                        LabeledRow("Kích thước", value: "\(Int(size * 100))%")
                         Slider(value: $size, in: 0.6...2, step: 0.1)
                     }
                     Button("Xoá nút", role: .destructive) {
@@ -908,8 +883,7 @@ struct KeyEditor: View {
                 }
                 .listRowBackground(Theme.card)
             }
-            .scrollContentBackground(.hidden)
-            .background(Theme.band)
+            .formBackground(Theme.band)
             .navigationTitle("Sửa nút")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -920,8 +894,8 @@ struct KeyEditor: View {
             }
             .onAppear(perform: load)
         }
-        .presentationDetents([.medium, .large])
-        .presentationCornerRadius(28)
+        .navigationViewStyle(.stack)
+        .sheetStyle()
     }
 
     private func load() {

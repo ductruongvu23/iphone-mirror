@@ -293,7 +293,7 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
         }
         if let pairCode { auth["pair"] = pairCode }
         let msg = (try? JSONSerialization.data(withJSONObject: auth)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-        lock.withLock {
+        lock.locked {
             authMsg = msg
             lastCandidate = last
         }
@@ -326,7 +326,7 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
 
     /// Người dùng đồng ý tin chứng chỉ mới của PC (PC đổi IP thì tự tạo chứng chỉ khác).
     func trustNewCert() {
-        lock.withLock { trustNext = true }
+        lock.locked { trustNext = true }
         connect()
     }
 
@@ -417,7 +417,7 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
             switch type {
             case "hello":
                 state = .streaming
-                lock.withLock {
+                lock.locked {
                     if let h = seenHash { host.certHash = h; pinnedHash = h }
                     trustNext = false
                 }
@@ -550,7 +550,7 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
     // MARK: URLSessionWebSocketDelegate
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
-        send(text: lock.withLock { authMsg }, on: webSocketTask)
+        send(text: lock.locked { authMsg }, on: webSocketTask)
     }
 
     /// PC dùng chứng chỉ tự ký: tin theo kiểu "lần đầu" (như SSH), sau đó chỉ nhận đúng chứng chỉ đã nhớ.
@@ -561,7 +561,7 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
               let leaf = (SecTrustCopyCertificateChain(trust) as? [SecCertificate])?.first
         else { return completionHandler(.performDefaultHandling, nil) }
         let hash = SHA256.hash(data: SecCertificateCopyData(leaf) as Data).map { String(format: "%02x", $0) }.joined()
-        let (ok, last): (Bool, Bool) = lock.withLock {
+        let (ok, last): (Bool, Bool) = lock.locked {
             guard pinnedHash == nil || pinnedHash == hash || trustNext else { return (false, lastCandidate) }
             seenHash = hash
             return (true, lastCandidate)

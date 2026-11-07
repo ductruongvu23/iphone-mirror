@@ -7,8 +7,8 @@ struct ContentView: View {
     @StateObject private var discovery = Discovery()
     @State private var active: Session?
     @State private var loginTarget: SavedHost?
-    @State private var askLogin = false
-    @State private var adding = false
+    @State private var form: LoginForm?
+    @State private var pending: (host: SavedHost, password: String)?  // mở phiên sau khi sheet đóng hẳn
     @State private var user = ""
     @State private var pass = ""
     @State private var address = ""
@@ -22,34 +22,32 @@ struct ContentView: View {
         ScrollView {
             VStack(spacing: 0) {
                 hero
-                hosts
+                hosts.sheet(item: $form, onDismiss: {
+                    if let p = pending { pending = nil; start(p.host, password: p.password) }
+                }) { f in
+                    LoginSheet(title: f == .add ? "Thêm PC bằng địa chỉ" : "Đăng nhập",
+                               message: f == .add
+                                   ? "Ở xa không quét được mã QR thì nhập tên miền riêng đặt trên cửa sổ PC (hoặc IP nhà) và tài khoản của PC."
+                                   : "Tài khoản tạo trên cửa sổ Remote Desk ở \(loginTarget?.name ?? "PC").",
+                               address: f == .add ? $address : nil, user: $user, pass: $pass) {
+                        if f == .add {
+                            let a = SavedHost.normalize(address)
+                            pending = (SavedHost(name: a, address: a, user: user), pass)
+                            address = ""
+                        } else if var h = loginTarget {
+                            h.user = user
+                            pending = (h, pass)
+                        }
+                        pass = ""
+                        form = nil
+                    } cancel: {
+                        pass = ""
+                        form = nil
+                    }
+                }
             }
         }
         .background(Theme.band.ignoresSafeArea())
-        .alert("Đăng nhập", isPresented: $askLogin) {
-            TextField("Tên đăng nhập", text: $user).textInputAutocapitalization(.never).autocorrectionDisabled()
-            SecureField("Mật khẩu", text: $pass)
-            Button("Đăng nhập") {
-                if var h = loginTarget { h.user = user; start(h, password: pass) }
-                pass = ""
-            }
-            Button("Huỷ", role: .cancel) { pass = "" }
-        } message: { Text("Tài khoản tạo trên cửa sổ Remote Desk ở \(loginTarget?.name ?? "PC").") }
-        .alert("Thêm PC bằng địa chỉ", isPresented: $adding) {
-            TextField("IP hoặc tên miền, ví dụ nha.duckdns.org", text: $address).keyboardType(.URL)
-                .textInputAutocapitalization(.never).autocorrectionDisabled()
-            TextField("Tên đăng nhập", text: $user).textInputAutocapitalization(.never).autocorrectionDisabled()
-            SecureField("Mật khẩu", text: $pass)
-            Button("Đăng nhập") {
-                let a = SavedHost.normalize(address)
-                start(SavedHost(name: a, address: a, user: user), password: pass)
-                address = ""
-                pass = ""
-            }
-            Button("Huỷ", role: .cancel) { pass = "" }
-        } message: {
-            Text("Ở xa không quét được mã QR thì nhập tên miền riêng đặt trên cửa sổ PC (hoặc IP nhà) và tài khoản của PC.")
-        }
         .alert("Không tìm được địa chỉ PC", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("OK", role: .cancel) {}
         } message: { Text(error ?? "") }
@@ -59,12 +57,12 @@ struct ContentView: View {
         .sheet(isPresented: $scanning, onDismiss: {  // mở phiên sau khi sheet đóng hẳn, không thì fullScreenCover không hiện
             if let u = scanned { scanned = nil; pair(u) }
         }) {
-            NavigationStack {
+            NavigationView {
                 Group {
-                    if QRScanner.available {
+                    if #available(iOS 16, *), QRScanner.available {
                         QRScanner { scanned = $0; scanning = false }.ignoresSafeArea()
                     } else {
-                        Text("Không mở được camera trong app. Cho phép Remote Desk dùng camera trong Cài đặt, hoặc quét mã bằng app Camera của iPhone.")
+                        Text("Không quét được trong app (cần iOS 16 và quyền camera). Mở app Camera của iPhone, quét mã trên PC rồi chạm thông báo: Remote Desk tự mở và vào thẳng.")
                             .font(.text(17)).foregroundStyle(Theme.slate).padding(28)
                     }
                 }
@@ -72,6 +70,7 @@ struct ContentView: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { scanning = false } } }
             }
+            .navigationViewStyle(.stack)
         }
         .onOpenURL(perform: pair)  // quét bằng app Camera: iOS mở remotedesk://pair?... vào thẳng app
         .onAppear { discovery.start() }
@@ -116,7 +115,7 @@ struct ContentView: View {
             HStack(alignment: .firstTextBaseline) {
                 Text("PC của bạn").font(.display(28)).foregroundStyle(Theme.ink)
                 Spacer()
-                Button("Thêm bằng địa chỉ ›") { adding = true }
+                Button("Thêm bằng địa chỉ ›") { form = .add }
                     .font(.text(17)).foregroundStyle(Theme.link)
             }
             if let newVersion { UpdateCard(version: newVersion) }
@@ -171,7 +170,7 @@ struct ContentView: View {
         } else {
             loginTarget = h
             user = h.user ?? ""
-            askLogin = true
+            form = .login
         }
     }
 
@@ -187,6 +186,49 @@ struct ContentView: View {
         let s = Session(host: h, password: password, pairCode: pairCode)
         s.onHostUpdate = { store.upsert($0) }  // chỉ lưu máy chủ khi PC đã nhận đăng nhập
         active = s
+    }
+}
+
+enum LoginForm: Identifiable {
+    case login, add
+    var id: Self { self }
+}
+
+/// Đăng nhập (kèm địa chỉ PC khi thêm bằng tay) dạng sheet: ô nhập trong alert chỉ có từ iOS 16.
+struct LoginSheet: View {
+    let title: String
+    let message: String
+    var address: Binding<String>? = nil
+    @Binding var user: String
+    @Binding var pass: String
+    var submit: () -> Void
+    var cancel: () -> Void
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section {
+                    if let address {
+                        TextField("IP hoặc tên miền, ví dụ nha.duckdns.org", text: address).keyboardType(.URL)
+                            .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    }
+                    TextField("Tên đăng nhập", text: $user).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    SecureField("Mật khẩu", text: $pass)
+                } footer: { Text(message) }
+                .listRowBackground(Theme.card)
+            }
+            .formBackground(Theme.band)
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Huỷ", action: cancel) }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Đăng nhập", action: submit).disabled(pass.isEmpty || address?.wrappedValue.isEmpty == true)
+                }
+            }
+        }
+        .navigationViewStyle(.stack)
+        .sheetStyle()
     }
 }
 

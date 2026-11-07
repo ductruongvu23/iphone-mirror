@@ -42,7 +42,7 @@ extension Font {
 struct BluePill: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.text(14)).tracking(-0.12)
+            .font(.text(14))
             .foregroundStyle(.white)
             .padding(.horizontal, 16).padding(.vertical, 8)
             .background(Theme.pill.opacity(configuration.isPressed ? 0.75 : 1), in: Capsule())
@@ -53,7 +53,7 @@ struct BluePill: ButtonStyle {
 struct OutlinePill: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.text(14)).tracking(-0.12)
+            .font(.text(14))
             .foregroundStyle(Theme.ink)
             .padding(.horizontal, 16).padding(.vertical, 8)
             .background(configuration.isPressed ? Theme.band : Color.clear, in: Capsule())
@@ -62,6 +62,27 @@ struct OutlinePill: ButtonStyle {
 }
 
 extension View {
+    /// Sheet nửa màn hình bo 28 (iOS 16+); iOS 15 hiện toàn trang.
+    @ViewBuilder func sheetStyle() -> some View {
+        if #available(iOS 16.4, *) {
+            presentationDetents([.medium, .large]).presentationCornerRadius(28)
+        } else if #available(iOS 16, *) {
+            presentationDetents([.medium, .large])
+        } else {
+            self
+        }
+    }
+
+    /// Form trên nền #f5f5f7 (iOS 16+ mới ẩn được nền mặc định của Form; iOS 15 giữ nền hệ thống).
+    @ViewBuilder func formBackground(_ c: Color) -> some View {
+        if #available(iOS 16, *) { scrollContentBackground(.hidden).background(c) } else { self }
+    }
+
+    /// Màn điều khiển: ẩn thanh Home, hoãn cử chỉ hệ thống ở mép để vuốt trong game không bị thoát (iOS 16+).
+    @ViewBuilder func gameScreen() -> some View {
+        if #available(iOS 16, *) { persistentSystemOverlays(.hidden).defersSystemGestures(on: .all) } else { self }
+    }
+
     /// Thẻ trắng bo 28, không viền, không bóng.
     func card(_ radius: CGFloat = 28) -> some View {
         background(Theme.card, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
@@ -71,5 +92,27 @@ extension View {
     func overlayTrack(_ radius: CGFloat) -> some View {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
         return background(Theme.overlay, in: shape).background(.ultraThinMaterial, in: shape)
+    }
+}
+
+/// Dòng "tên ... giá trị" như LabeledContent (chỉ có từ iOS 16).
+struct LabeledRow: View {
+    let title: String, value: String
+    init(_ title: String, value: String) { self.title = title; self.value = value }
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value).foregroundStyle(.secondary)
+        }
+    }
+}
+
+extension NSLock {
+    /// Như withLock (iOS 16+), chạy cả iOS 15.
+    func locked<T>(_ body: () throws -> T) rethrows -> T {
+        lock()
+        defer { unlock() }
+        return try body()
     }
 }

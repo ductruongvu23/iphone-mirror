@@ -1,5 +1,5 @@
-import CoreTransferable
-import Foundation
+import PhotosUI
+import SwiftUI
 import UniformTypeIdentifiers
 
 /// Một lần gửi/nhận file, hiện thành dải nhỏ dưới thanh công cụ.
@@ -48,20 +48,57 @@ enum Files {
         return dst
     }
 
-    /// Ảnh trong Thư viện không có tên gốc: đặt theo giờ chụp chọn, giữ đuôi đúng định dạng (heic, jpg, png...).
-    static func photoName(_ i: Int, ext: String) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "yyyyMMdd-HHmmss"
-        return "Anh-\(f.string(from: Date()))-\(i + 1).\(ext)"
+    /// Bảng chia sẻ của iOS (lưu vào Ảnh, mở bằng app khác); ShareLink chỉ có từ iOS 16.
+    static func share(_ url: URL) {
+        let vc = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        guard var top = scene?.keyWindow?.rootViewController else { return }
+        while let p = top.presentedViewController { top = p }
+        vc.popoverPresentationController?.sourceView = top.view
+        top.present(vc, animated: true)
     }
 }
 
-/// Video chọn từ Thư viện: nhận thẳng thành file (không nạp cả video vào bộ nhớ).
-struct PickedMovie: Transferable {
-    let url: URL
-    static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(contentType: .movie) { SentTransferredFile($0.url) } importing: { r in
-            Self(url: try Files.stage(r.file))
+/// Chọn ảnh, video trong Thư viện bằng PHPicker (có từ iOS 14, không cần xin quyền Ảnh). Mỗi mục chép ra file tạm
+/// giữ tên và định dạng gốc (HEIC, MOV...) rồi gửi sang PC; video nhận thẳng thành file, không nạp vào bộ nhớ.
+struct PhotoPicker: UIViewControllerRepresentable {
+    var done: ([URL]) -> Void
+
+    func makeUIViewController(context: Context) -> PHPickerViewController {
+        var c = PHPickerConfiguration()
+        c.filter = .any(of: [.images, .videos])
+        c.selectionLimit = 20
+        c.preferredAssetRepresentationMode = .current  // giữ định dạng gốc, không đổi HEIC sang JPEG
+        let vc = PHPickerViewController(configuration: c)
+        vc.delegate = context.coordinator
+        return vc
+    }
+
+    func updateUIViewController(_ vc: PHPickerViewController, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator(done: done) }
+
+    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        let done: ([URL]) -> Void
+        init(done: @escaping ([URL]) -> Void) { self.done = done }
+
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            picker.dismiss(animated: true)
+            let group = DispatchGroup(), lock = NSLock()
+            var urls: [URL] = []
+            for r in results {
+                let p = r.itemProvider
+                guard let type = p.registeredTypeIdentifiers.first(where: { UTType($0)?.conforms(to: .movie) == true })
+                        ?? p.registeredTypeIdentifiers.first(where: { UTType($0)?.conforms(to: .image) == true }) else { continue }
+                group.enter()
+                p.loadFileRepresentation(forTypeIdentifier: type) { url, _ in
+                    defer { group.leave() }
+                    guard let url else { return }  // file tạm chỉ còn trong lúc gọi lại: chép ngay
+                    let ext = url.pathExtension.isEmpty ? (UTType(type)?.preferredFilenameExtension ?? "bin") : url.pathExtension
+                    let name = p.suggestedName.map { "\($0).\(ext)" } ?? url.lastPathComponent
+                    if let s = try? Files.stage(url, name: name) { lock.locked { urls.append(s) } }
+                }
+            }
+            group.notify(queue: .main) { [done] in done(urls) }
         }
     }
 }

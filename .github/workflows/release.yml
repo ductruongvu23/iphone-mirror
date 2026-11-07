@@ -75,7 +75,7 @@ jobs:
               "localizedDescription": "Điều khiển PC Windows từ iPhone: hình HEVC độ trễ thấp, keymap cho game, chuyển file.",
               "iconURL": "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/ios/RemoteDesk/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
               "versions": [{"version": "${TAG#v}", "date": "$(date -u +%Y-%m-%d)", "size": os.path.getsize(ipa),
-                            "downloadURL": base + "/releases/download/$TAG/" + ipa, "minOSVersion": "17.0"}],
+                            "downloadURL": base + "/releases/download/$TAG/" + ipa, "minOSVersion": "15.0"}],
               "appPermissions": {"entitlements": [], "privacy": {
                   "NSLocalNetworkUsageDescription": "Để tìm và điều khiển PC chạy Remote Desk trong mạng nhà bạn.",
                   "NSCameraUsageDescription": "Để quét mã QR trên cửa sổ Remote Desk ở PC, không phải nhập địa chỉ IP."}}}],
