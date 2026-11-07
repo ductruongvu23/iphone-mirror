@@ -48,6 +48,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <condition_variable>
 #include <vector>
 
 // mingw thiếu uuid này cho ComPtr::As
@@ -243,11 +244,14 @@ struct Capture {
 
 // BGRA (sw×sh) -> NV12 (dw×dh), co giãn lấy mẫu gần nhất, hệ số BT.709 giới hạn (trình duyệt mặc định 709 cho HD).
 // shortcut: đổi màu trên CPU (~3 ms ở 1080p); muốn 4K/120 thì chuyển sang Video Processor trên GPU.
+// Chia hàng cho các nhân CPU (1080p một nhân mất ~9 ms, là một nửa thời gian của cả khung). Mỗi phần bắt đầu ở hàng
+// chẵn vì hàng UV đi theo hàng chẵn, nên các phần không ghi đè nhau.
 static void bgra_to_nv12(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh) {
     std::vector<int> sxs(dw);
     for (int x = 0; x < dw; x++) sxs[x] = (int)((int64_t)x * sw / dw) * 4;
     uint8_t* uv = dst + (size_t)dw * dh;
-    for (int y = 0; y < dh; y++) {
+    auto rows = [&](int y0, int y1) {
+    for (int y = y0; y < y1; y++) {
         const uint8_t* row = src + (size_t)((int64_t)y * sh / dh) * sw * 4;
         uint8_t* yd = dst + (size_t)y * dw;
         for (int x = 0; x < dw; x++) {
@@ -262,6 +266,13 @@ static void bgra_to_nv12(const uint8_t* src, int sw, int sh, uint8_t* dst, int d
             ud[x + 1] = (uint8_t)(((112 * p[2] - 102 * p[1] - 10 * p[0] + 128) >> 8) + 128);
         }
     }
+    };
+    int n = dh < 64 ? 1 : (int)std::clamp(std::thread::hardware_concurrency(), 1u, 8u);
+    int step = ((dh + n - 1) / n + 1) & ~1;
+    std::vector<std::thread> th;
+    for (int y0 = step; y0 < dh; y0 += step) th.emplace_back(rows, y0, std::min(dh, y0 + step));
+    rows(0, std::min(dh, step));
+    for (auto& t : th) t.join();
 }
 
 // ======================= Mã hoá HEVC / H.264 (Media Foundation) =======================
@@ -271,7 +282,7 @@ struct Encoder {
     ComPtr<ICodecAPI> api;
     DWORD in_id = 0, out_id = 0, out_cb = 0;
     bool async = false, provides = false, hevc = false;  // HEVC: cùng chất lượng tốn khoảng nửa bitrate so với H.264
-    int w = 0, h = 0, fps = 0, need_input = 0;
+    int w = 0, h = 0, fps = 0, need_input = 0, pending = 0;  // pending: khung đã đưa vào, chưa lấy gói ra
     string name, hdrs;
 
     bool setv(const GUID& g, UINT v, VARTYPE vt = VT_UI4) {
@@ -354,8 +365,9 @@ struct Encoder {
                     std::vector<uint8_t> blank((size_t)w * h * 3 / 2, 128);
                     std::vector<string> o;
                     ok = encode(blank.data(), 0, true, o);
+                    drain(o, 200);  // gói của khung thử bỏ đi tại đây, không để lẫn vào lượt phát đầu
                 }
-                if (!ok) { if (mft) acts[i]->ShutdownObject(); mft.Reset(), gen.Reset(), api.Reset(), need_input = 0, hdrs.clear(); }
+                if (!ok) { if (mft) acts[i]->ShutdownObject(); mft.Reset(), gen.Reset(), api.Reset(), need_input = 0, pending = 0, hdrs.clear(); }
                 acts[i]->Release();
             }
             CoTaskMemFree(acts);
@@ -420,20 +432,30 @@ struct Encoder {
             return true;
         }
         MediaEventType t;
-        while (!need_input) {
+        while (!need_input) {  // encoder thường nhận khung mới ngay; gói xong trong lúc chờ thì lấy luôn
             if (!event(t, true)) return false;
             if (t == METransformNeedInput) need_input++;
-            else if (t == METransformHaveOutput) pull(out);
+            else if (t == METransformHaveOutput) pull(out), pending = std::max(0, pending - 1);
         }
         if (FAILED(mft->ProcessInput(in_id, s.Get(), 0))) return false;
-        need_input--;
-        // chờ hình của chính khung này (tối đa 50 ms) thay vì để nó trễ sang lượt sau
-        for (auto t0 = Clock::now(); Clock::now() - t0 < std::chrono::milliseconds(50);) {
-            if (!event(t, false)) { Sleep(1); continue; }
-            if (t == METransformNeedInput) need_input++;
-            else if (t == METransformHaveOutput) { pull(out); break; }
-        }
+        need_input--, pending++;
+        // Không ngủ chờ gói của khung này (Sleep trên Windows có thể tới 15,6 ms, làm khung/s tụt còn ~30):
+        // vòng phát gọi drain() mỗi lượt và chụp khung kế trong lúc NVENC đang mã hoá.
+        drain(out);
         return true;
+    }
+    // Lấy các gói đã mã hoá xong; wait_ms > 0 thì chờ tới khi lấy hết hoặc hết giờ (dùng khi thử và khi kết thúc).
+    void drain(std::vector<string>& out, int wait_ms = 0) {
+        MediaEventType t;
+        for (auto t0 = Clock::now(); async && pending > 0;) {
+            if (!event(t, false)) {
+                if (Clock::now() - t0 >= std::chrono::milliseconds(wait_ms)) break;
+                Sleep(1);
+                continue;
+            }
+            if (t == METransformNeedInput) need_input++;
+            else if (t == METransformHaveOutput) pull(out), pending--;
+        }
     }
 };
 
@@ -1722,18 +1744,66 @@ struct Session {
             enc_name = enc.name, vw = dw, vh = dh;
         }
         logf("Phát tới %s: %dx%d, %d fps, %d Mbps, %s", peer.c_str(), dw, dh, fps, mbps, enc.name.c_str());
-        std::vector<uint8_t> nv12((size_t)dw * dh * 3 / 2);
+        const size_t nvsz = (size_t)dw * dh * 3 / 2;
         std::vector<string> out;
         auto period = std::chrono::microseconds(1000000 / fps);
-        auto last = Clock::now() - period, win = Clock::now();
+        auto win = Clock::now();
         Clock::duration busy{};  // thời gian bị kẹt khi gửi trong giây hiện tại
         int cur = mbps, calm = 0;
-        bool dirty = false, abr_warned = false;
+        bool abr_warned = false;
         live_mbps = mbps;
+        // Hai luồng chồng nhau: luồng chụp lo chụp + con trỏ + đổi màu (~11 ms/khung 1080p), luồng này lo mã hoá và gửi.
+        // Nối đuôi nhau thì mỗi khung ~22 ms, chỉ được ~45 khung/s dù game chạy 60+.
+        std::mutex qm;
+        std::condition_variable qc;
+        std::vector<uint8_t> slot(nvsz), work(nvsz);  // slot: khung mới nhất chờ mã hoá; chưa kịp lấy thì bị khung sau ghi đè
+        bool ready = false;
+        std::thread capt([&] {
+            std::vector<uint8_t> buf(nvsz);
+            auto next = Clock::now();  // hạn khung kế theo lịch (giữ nhịp trung bình đúng fps)
+            bool dirty = true;
+            while (!stop && !restart) {
+                int r = cap.grab((UINT)(period.count() / 2000 + 1));
+                if (r < 0) { Sleep(100); if (!cap.init()) Sleep(500); dirty = true; continue; }  // UAC, đổi độ phân giải...
+                dirty |= r > 0;
+                bool key = want_key.load();  // xin khung khoá khi màn hình đứng yên: mã hoá lại hình cuối
+                // Nhận sớm tới 1/4 nhịp rồi dời hạn theo lịch: game 64 khung/s mà đòi đủ 16,7 ms mỗi khung thì khung đến
+                // sớm 1 ms bị bỏ, chỉ còn ~45 khung/s. Tụt nhịp thì không dồn khung bù.
+                auto now = Clock::now();
+                if ((!dirty && !key) || cap.bgra.empty() || (now < next - period / 4 && !key)) continue;
+                next = std::max(next + period, now - period / 2), dirty = false;
+                cap.cursor(true);
+                bgra_to_nv12(cap.bgra.data(), cap.w, cap.h, buf.data(), dw, dh);
+                cap.cursor(false);
+                {
+                    std::lock_guard g(qm);
+                    slot.swap(buf), ready = true;
+                }
+                qc.notify_one();
+            }
+            qc.notify_one();
+        });
+        auto send = [&]() {
+            for (auto& o : out) {
+                auto t0 = Clock::now();
+                // byte đầu: bit 0 = khung khoá, bit 1 = HEVC
+                if (!ws_send(t, 2, string(1, (char)(is_key(o, enc.hevc) | (enc.hevc ? 2 : 0))) + o)) return false;
+                busy += Clock::now() - t0;
+                frames++, bytes += o.size();
+            }
+            out.clear();
+            return true;
+        };
         for (int64_t n = 1; !stop && !restart;) {
-            int r = cap.grab((UINT)(period.count() / 2000 + 1));
-            if (r < 0) { Sleep(100); if (!cap.init()) Sleep(500); dirty = true; continue; }  // UAC, đổi độ phân giải...
-            dirty |= r > 0;
+            bool got;
+            {  // còn khung đang mã hoá thì chỉ chờ 2 ms để gói xong được gửi ngay
+                std::unique_lock lk(qm);
+                qc.wait_for(lk, enc.pending ? std::chrono::microseconds(2000) : period, [&] { return ready || stop || restart; });
+                got = ready;
+                if (got) work.swap(slot), ready = false;
+            }
+            enc.drain(out);
+            if (!send()) { stop = true; break; }
             if (auto now = Clock::now(); now - win >= std::chrono::seconds(1)) {  // mỗi giây: mạng có theo kịp bitrate không
                 double frac = std::chrono::duration<double>(busy).count() / std::chrono::duration<double>(now - win).count();
                 int want = adapt_bitrate(cur, mbps, frac, calm);
@@ -1746,22 +1816,11 @@ struct Session {
                 }
                 win = now, busy = {};
             }
-            bool key = want_key.load();
-            if ((!dirty && !key) || cap.bgra.empty() || (Clock::now() - last < period && !key)) continue;
-            last = Clock::now(), dirty = false, want_key = false;
-            cap.cursor(true);
-            bgra_to_nv12(cap.bgra.data(), cap.w, cap.h, nv12.data(), dw, dh);
-            cap.cursor(false);
-            out.clear();
-            if (!enc.encode(nv12.data(), n++, key, out)) { logf("Encoder lỗi"); stop = true; break; }
-            for (auto& o : out) {
-                auto t0 = Clock::now();
-                // byte đầu: bit 0 = khung khoá, bit 1 = HEVC
-                if (!ws_send(t, 2, string(1, (char)(is_key(o, enc.hevc) | (enc.hevc ? 2 : 0))) + o)) { stop = true; break; }
-                busy += Clock::now() - t0;
-                frames++, bytes += o.size();
-            }
+            if (!got) continue;
+            if (!enc.encode(work.data(), n++, want_key.exchange(false), out)) { logf("Encoder lỗi"); stop = true; break; }
+            if (!send()) { stop = true; break; }
         }
+        capt.join();
         enc.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     }
 
@@ -3001,6 +3060,21 @@ static int self_test() {
     std::vector<uint8_t> px = {255, 255, 255, 0, 0, 0, 0, 0, 128, 128, 128, 0, 128, 128, 128, 0}, nv(6);
     bgra_to_nv12(px.data(), 2, 2, nv.data(), 2, 2);
     CHECK(nv[0] == 235 && nv[1] == 16 && nv[4] == 128 && nv[5] == 128);
+    {  // chia nhiều nhân phải ra đúng như một nhân (so với cách tính từng điểm)
+        int W = 640, H = 362;
+        std::vector<uint8_t> src((size_t)W * H * 4), a((size_t)W * H * 3 / 2);
+        for (size_t i = 0; i < src.size(); i++) src[i] = (uint8_t)(i * 31 + i / 7);
+        bgra_to_nv12(src.data(), W, H, a.data(), W, H);
+        bool same = true;
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                const uint8_t* q = &src[((size_t)y * W + x) * 4];
+                same &= a[(size_t)y * W + x] == (uint8_t)(((47 * q[2] + 157 * q[1] + 16 * q[0] + 128) >> 8) + 16);
+                if (!(y & 1) && !(x & 1))
+                    same &= a[(size_t)W * H + (size_t)(y / 2) * W + x] == (uint8_t)(((-26 * q[2] - 86 * q[1] + 112 * q[0] + 128) >> 8) + 128);
+            }
+        CHECK(same);
+    }
     // SPS/PPS gắn lại vào IDR
     string hdr, k1 = string("\0\0\0\1\x67\x42\0\0\1\x68\xce\0\0\1\x65\x88", 16), k2 = string("\0\0\0\1\x65\x99", 6);
     CHECK(fix_headers(k1, hdr) && hdr.size() == 12 && fix_headers(k2, hdr) && has_nal(k2, 7) && has_nal(k2, 8));
@@ -3015,10 +3089,11 @@ static int self_test() {
         std::vector<bool> keys;
         for (int i = 1; i <= 8; i++) {
             for (size_t j = 0; j < f.size(); j++) f[j] = (uint8_t)(j * 7 + i * 13);
-            size_t before = o.size();
             CHECK(e.encode(f.data(), i, i == 1 || i == 5, o));  // init đã dùng IDR đầu cho khung thử
-            for (size_t j = before; j < o.size(); j++) keys.push_back(has_nal(o[j], 5));
         }
+        e.drain(o, 500);
+        CHECK(e.pending == 0 && o.size() == 8);  // đủ một gói cho mỗi khung, không mất khung nào
+        for (auto& x : o) keys.push_back(has_nal(x, 5));
         CHECK(!o.empty() && has_nal(o[0], 7) && has_nal(o[0], 5));
         CHECK(std::count(keys.begin(), keys.end(), true) >= 1 && std::count(keys.begin(), keys.end(), false) >= 1);
         printf("encoder %s: %s, %zu gói, khoá ở %s\n", only == 1 ? "phần cứng" : "phần mềm", e.name.c_str(), o.size(),
@@ -3032,6 +3107,7 @@ static int self_test() {
             std::vector<uint8_t> f(640 * 360 * 3 / 2, 100);
             std::vector<string> o;
             for (int i = 1; i <= 4; i++) CHECK(e.encode(f.data(), i, i == 1, o));
+            e.drain(o, 500);
             CHECK(!o.empty() && has_nal(o[0], 32, true) && has_nal(o[0], 33, true) && has_nal(o[0], 34, true) && is_key(o[0], true));
             printf("encoder HEVC: %s, %zu gói\n", e.name.c_str(), o.size());
         } else {
@@ -3064,6 +3140,11 @@ int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);  // chụp và bấm theo pixel thật
     timeBeginPeriod(1);
+    // Windows 11 bỏ qua timeBeginPeriod và hạ tốc tiến trình khi cửa sổ bị che, thu nhỏ hay ở màn khác (lúc người dùng
+    // đang chơi game): Sleep(1) thành 15,6 ms và khung/s tụt còn ~30. Xin giữ độ chính xác bộ đếm giờ và tốc độ đầy đủ.
+    PROCESS_POWER_THROTTLING_STATE pt{PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                                      PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, 0};
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof pt);
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     MFStartup(MF_VERSION);
