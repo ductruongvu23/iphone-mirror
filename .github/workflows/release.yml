@@ -19,7 +19,7 @@ jobs:
       - name: Self-test trên iOS Simulator
         run: bash ios/build.sh --test
       - name: Build IPA chưa ký
-        run: bash ios/build.sh
+        run: VERSION=${GITHUB_REF_NAME#v} bash ios/build.sh
       - uses: actions/upload-artifact@v4
         with:
           name: ios
@@ -38,7 +38,7 @@ jobs:
           install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-nsis
       # Máy CI không có GPU và màn hình nên không chạy --self-test (cần NVENC và DXGI); self-test chạy trên PC thật.
       - name: Build remote_host.exe
-        run: bash build_host.sh
+        run: VERSION=${GITHUB_REF_NAME#v} bash build_host.sh
       - name: Gói app PC (exe + trang cho Safari)
         shell: pwsh
         run: Compress-Archive -Path remote_host.exe, remote_desktop.html -DestinationPath RemoteDesk-Windows.zip
@@ -64,6 +64,23 @@ jobs:
           mv ios/RemoteDesk-unsigned.ipa "RemoteDesk-iOS-$TAG-unsigned.ipa"
           mv windows/RemoteDesk-Windows.zip "RemoteDesk-Windows-$TAG.zip"
           mv windows/RemoteDesk-Setup-*.exe "RemoteDesk-Windows-$TAG-Setup.exe"
+          # Nguồn AltStore/SideStore: thêm một lần thì chúng tự cập nhật app iPhone khi có Release mới
+          # (link cố định .../releases/latest/download/altstore.json luôn trỏ tới bản mới nhất)
+          python3 - <<PY
+          import json, os
+          ipa = "RemoteDesk-iOS-$TAG-unsigned.ipa"
+          base = "https://github.com/$GITHUB_REPOSITORY"
+          json.dump({"name": "Remote Desk", "identifier": "vn.vdt.remotedesk.source", "website": base, "apps": [{
+              "name": "Remote Desk", "bundleIdentifier": "vn.vdt.remotedesk", "developerName": "$GITHUB_REPOSITORY_OWNER",
+              "localizedDescription": "Điều khiển PC Windows từ iPhone: hình HEVC độ trễ thấp, keymap cho game, chuyển file.",
+              "iconURL": "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/ios/RemoteDesk/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+              "versions": [{"version": "${TAG#v}", "date": "$(date -u +%Y-%m-%d)", "size": os.path.getsize(ipa),
+                            "downloadURL": base + "/releases/download/$TAG/" + ipa, "minOSVersion": "17.0"}],
+              "appPermissions": {"entitlements": [], "privacy": {
+                  "NSLocalNetworkUsageDescription": "Để tìm và điều khiển PC chạy Remote Desk trong mạng nhà bạn.",
+                  "NSCameraUsageDescription": "Để quét mã QR trên cửa sổ Remote Desk ở PC, không phải nhập địa chỉ IP."}}}],
+              "news": []}, open("altstore.json", "w"), ensure_ascii=False, indent=2)
+          PY
           cat > notes.md <<EOF
           ## Remote Desk $TAG
 
@@ -81,4 +98,4 @@ jobs:
           4. Keymap có sẵn cho Minecraft, CS2, Valorant, PUBG, Genshin, Star Rail, ZZZ, Wuthering Waves, Roblox, GTA V, MOBA.
           EOF
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "Remote Desk $TAG" --notes-file notes.md \
-            "RemoteDesk-iOS-$TAG-unsigned.ipa" "RemoteDesk-Windows-$TAG-Setup.exe" "RemoteDesk-Windows-$TAG.zip"
+            "RemoteDesk-iOS-$TAG-unsigned.ipa" "RemoteDesk-Windows-$TAG-Setup.exe" "RemoteDesk-Windows-$TAG.zip" altstore.json

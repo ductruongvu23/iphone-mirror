@@ -193,6 +193,7 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
     @Published var link = LinkStats()
     @Published var editing = false
     @Published var editIndex: Int?
+    @Published var transfer: FileTransfer?  // shortcut: chỉ hiện lần gửi/nhận mới nhất, đủ cho một người dùng
     // Hồ sơ keymap theo game; hồ sơ đang dùng quyết định nút và kiểu chạm. Lưu trên iPhone.
     @Published var profiles: [KeyProfile] { didSet { UserDefaults.standard.set(try? JSONEncoder().encode(profiles), forKey: "profiles") } }
     @Published var activeID: UUID {
@@ -237,6 +238,8 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
     private var candidates: [String] = [], attempt = 0
     private(set) var current = ""  // địa chỉ đang dùng
     private let path = NWPathMonitor()
+    private var sendQueue: [URL] = [], sending = false
+    private var progressObs: NSKeyValueObservation?
     private var onWiFi = true
 
     init(host: SavedHost, password: String? = nil, pairCode: String? = nil) {
@@ -407,6 +410,7 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
         guard let d = s.data(using: .utf8), let m = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
               let type = m["t"] as? String else { return }
         let c = m["c"] as? Double, e = m["enc"] as? String, sz = m["size"] as? [Int], addrs = m["addrs"] as? [String]
+        let fileID = m["id"] as? String, fileName = m["name"] as? String
         if type == "hello", let tok = m["token"] as? String, tok.count == 64 { Keychain.set(host.address, tok) }  // vừa đăng nhập
         if type == "badlogin" { Keychain.delete(host.address) }  // khoá cũ bị thu hồi (PC đổi tài khoản / đăng xuất hết)
         DispatchQueue.main.async { [self] in
@@ -429,6 +433,8 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
                 state = .ended("PC chưa có tài khoản. Mở Remote Desk trên PC và bấm \"Tạo tài khoản\".")
             case "locked":
                 state = .ended("Nhập sai quá nhiều lần nên PC tạm khoá địa chỉ này. Thử lại sau vài phút.")
+            case "file":  // PC gửi file: tự tải về Tệp > Remote Desk > Nhận từ PC
+                if let fileID, let fileName { receive(id: fileID, name: fileName) }
             case "pong":
                 if let c { link.ping = Int(CACurrentMediaTime() * 1000 - c) }
                 link.enc = e ?? ""
@@ -459,6 +465,85 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
                     state = .failed(error.localizedDescription)
                 }
             }
+        }
+    }
+
+    // MARK: chuyển file (mỗi file một kết nối HTTPS tới PC, cùng địa chỉ và chứng chỉ đã ghim với phiên)
+
+    /// Gửi file sang PC (lưu ở Tải về\Remote Desk). Các file đã chép sẵn vào thư mục tạm, gửi lần lượt, xong thì xoá.
+    func send(files: [URL]) {
+        sendQueue += files
+        if !sending { nextUpload() }
+    }
+
+    private func request(_ path: String, _ query: String, _ value: String) -> URLRequest? {
+        guard let tok = Keychain.get(host.address), var c = URLComponents(string: "https://\(current)\(path)") else { return nil }
+        c.queryItems = [URLQueryItem(name: query, value: value)]
+        guard let url = c.url else { return nil }
+        var req = URLRequest(url: url)
+        req.setValue(tok, forHTTPHeaderField: "X-Token")
+        return req
+    }
+
+    private func nextUpload() {
+        guard !sendQueue.isEmpty else { sending = false; return }
+        sending = true
+        let file = sendQueue.removeFirst()
+        let name = file.lastPathComponent
+        guard var req = request("/upload", "name", name) else {
+            transfer = FileTransfer(name: name, sending: true, failed: "Chưa đăng nhập PC")
+            return nextUpload()
+        }
+        req.httpMethod = "POST"
+        transfer = FileTransfer(name: name, sending: true)
+        let t = urlSession.uploadTask(with: req, fromFile: file) { [weak self] _, resp, err in
+            try? FileManager.default.removeItem(at: file.deletingLastPathComponent())  // thư mục tạm của Files.stage
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if code == 200 {
+                    self.transfer?.progress = 1
+                    let shown = self.transfer  // gửi xong thì tự ẩn dải sau vài giây
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 4) { if self.transfer == shown { self.transfer = nil } }
+                }
+                else { self.transfer?.failed = err?.localizedDescription ?? "PC không nhận file (mã \(code))" }
+                self.nextUpload()
+            }
+        }
+        watch(t)
+        t.resume()
+    }
+
+    private func receive(id: String, name: String) {
+        let name = Files.safeName(name)
+        guard let req = request("/file", "id", id) else { return }
+        transfer = FileTransfer(name: name, sending: false)
+        let t = urlSession.downloadTask(with: req) { [weak self] tmp, resp, err in
+            // file tạm bị xoá ngay khi hàm này trả về: phải dời đi ở đây
+            var saved: URL?, failed: String?
+            if let tmp, (resp as? HTTPURLResponse)?.statusCode == 200 {
+                do {
+                    try FileManager.default.createDirectory(at: Files.inbox, withIntermediateDirectories: true)
+                    let dst = Files.unique(Files.inbox, name)
+                    try FileManager.default.moveItem(at: tmp, to: dst)
+                    saved = dst
+                } catch { failed = error.localizedDescription }
+            } else {
+                failed = err?.localizedDescription ?? "PC không gửi được file"
+            }
+            DispatchQueue.main.async {
+                self?.transfer?.saved = saved
+                self?.transfer?.failed = failed
+                if saved != nil { self?.transfer?.progress = 1 }
+            }
+        }
+        watch(t)
+        t.resume()
+    }
+
+    private func watch(_ t: URLSessionTask) {
+        progressObs = t.progress.observe(\.fractionCompleted) { [weak self] p, _ in
+            DispatchQueue.main.async { if self?.transfer?.finished == false { self?.transfer?.progress = min(p.fractionCompleted, 0.99) } }
         }
     }
 

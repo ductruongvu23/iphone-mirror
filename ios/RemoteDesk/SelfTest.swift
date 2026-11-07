@@ -102,7 +102,7 @@ enum SelfTest {
         check(KeyProfile.presets.count >= 15 && Set(KeyProfile.presets.map(\.name)).count == KeyProfile.presets.count, "đủ mẫu, không trùng tên")
         print("self-test: xong keymap, kiểm bố cục \(KeyProfile.presets.count) mẫu")
         // Mỗi mẫu: phím PC hiểu được; nút không chồng nhau, không nằm dưới thanh công cụ, không lòi ra ngoài (iPhone 11 Pro Max nằm ngang)
-        let screen = CGRect(x: 0, y: 0, width: 896, height: 414), bar = CGRect(x: 448 - 165, y: 0, width: 330, height: 48)
+        let screen = CGRect(x: 0, y: 0, width: 896, height: 414), bar = CGRect(x: 448 - 180, y: 0, width: 360, height: 48)
         for p in KeyProfile.presets {
             for k in p.keys where !k.isValid { check(false, "\(p.name): phím \"\(k.keys)\" của nút \(k.label)") }
             let rects = p.keys.filter { !$0.isStick }.map { k -> CGRect in
@@ -127,6 +127,20 @@ enum SelfTest {
               && pr?.code == "0123abcd" && pr?.host.certHash == "aabb" && pr?.host.name == "DESKTOP-1", "đọc mã QR")
         check(SavedHost.pair(URL(string: "remotedesk://pair?a=1.2.3.4")!) == nil && SavedHost.pair(URL(string: "https://x/pair?a=1&c=2")!) == nil,
               "mã QR thiếu mã hoặc sai loại")
+
+        // Chuyển file và cập nhật
+        check(AppUpdate.newer("v1.10.0", than: "1.9.2") && !AppUpdate.newer("v1.2.0", than: "1.2.0") && !AppUpdate.newer("1.1", than: "1.2"),
+              "so phiên bản")
+        check(Files.safeName("../../x/a.txt") == "a.txt" && Files.safeName("..") == "file" && Files.safeName(" ") == "file"
+              && Files.safeName("C:\\a\\b.pdf") == "b.pdf", "tên file nhận")
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("st-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: tmp.appendingPathComponent("a.jpg").path, contents: Data())
+        check(Files.unique(tmp, "a.jpg").lastPathComponent == "a (1).jpg" && Files.unique(tmp, "b").lastPathComponent == "b", "tên trùng")
+        let staged = try? Files.stage(tmp.appendingPathComponent("a.jpg"))
+        check(staged?.lastPathComponent == "a.jpg" && staged.map { FileManager.default.fileExists(atPath: $0.path) } == true, "chép file tạm để gửi")
+        let src = AppUpdate.addSource("altstore")?.absoluteString ?? ""
+        check(src.hasPrefix("altstore://source?url=") && src.contains("altstore.json"), "link nguồn AltStore: \(src)")
 
         print(failed == 0 ? "self-test OK" : "self-test LỖI: \(failed)")
         usleep(300_000)  // cho simctl --console kịp đọc dòng cuối trước khi app thoát

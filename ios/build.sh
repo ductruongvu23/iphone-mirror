@@ -2,6 +2,7 @@
 # Build app iPhone Remote Desk (cần Mac có Xcode 16 trở lên).
 #   bash ios/build.sh          -> ios/build/RemoteDesk-unsigned.ipa (ký và cài bằng Sideloadly như WDA.ipa)
 #   bash ios/build.sh --test   -> chạy self-test trên iOS Simulator
+#   VERSION=1.2.0 bash ios/build.sh -> ghi số phiên bản vào app (app so với GitHub Release để báo bản mới)
 # Ký bằng Apple ID trong Xcode: mở ios/RemoteDesk.xcodeproj, chọn Team ở Signing & Capabilities,
 # cắm iPhone rồi bấm Run, hoặc Product > Archive > Distribute App để xuất .ipa.
 set -euo pipefail
@@ -52,7 +53,7 @@ PY
 fi
 
 xcb -quiet -project RemoteDesk.xcodeproj -target RemoteDesk -configuration Release -sdk iphoneos \
-  SYMROOT="$PWD/build" CODE_SIGNING_ALLOWED=NO build
+  SYMROOT="$PWD/build" CODE_SIGNING_ALLOWED=NO ${VERSION:+MARKETING_VERSION=$VERSION} build
 mkdir -p build/ipa/Payload
 cp -R build/Release-iphoneos/RemoteDesk.app build/ipa/Payload/
 (cd build/ipa && zip -qr ../RemoteDesk-unsigned.ipa Payload)

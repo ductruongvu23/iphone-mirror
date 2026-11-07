@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreMotion
+import PhotosUI
 import SwiftUI
 import UIKit
 
@@ -473,6 +474,9 @@ struct StreamView: View {
     @State private var user = ""
     @State private var pass = ""
     @State private var showSettings = false
+    @State private var pickPhotos = false
+    @State private var pickFiles = false
+    @State private var photoItems: [PhotosPickerItem] = []
 
     var body: some View {
         ZStack {
@@ -480,6 +484,9 @@ struct StreamView: View {
             StreamCanvas(session: session).ignoresSafeArea()
             VStack {
                 toolbar.opacity(1 - session.barFade)
+                if let tr = session.transfer {
+                    TransferBadge(transfer: tr) { session.transfer = nil }
+                }
                 Spacer()
                 if session.stats != .off && session.state == .streaming {
                     HStack {
@@ -492,6 +499,15 @@ struct StreamView: View {
             }
             .padding(.horizontal)
             statusCard
+        }
+        .photosPicker(isPresented: $pickPhotos, selection: $photoItems, maxSelectionCount: 20, matching: .any(of: [.images, .videos]))
+        .onChange(of: photoItems) { _, items in
+            guard !items.isEmpty else { return }
+            photoItems = []
+            Task { session.send(files: await Self.stage(items)) }
+        }
+        .fileImporter(isPresented: $pickFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { r in
+            if case .success(let urls) = r { session.send(files: urls.compactMap { try? Files.stage($0) }) }
         }
         .statusBarHidden()
         .persistentSystemOverlays(.hidden)
@@ -548,6 +564,14 @@ struct StreamView: View {
             .foregroundStyle(Theme.overlayInk)
             .accessibilityLabel("Hồ sơ keymap: \(session.profileName)")
             barButton("Bàn phím", "keyboard") { session.view?.toggleKeyboard() }
+            Menu {
+                Button { pickPhotos = true } label: { Label("Ảnh, video", systemImage: "photo.on.rectangle") }
+                Button { pickFiles = true } label: { Label("Tệp", systemImage: "folder") }
+            } label: {
+                Image(systemName: "square.and.arrow.up").font(.system(size: 15, weight: .semibold)).frame(width: 40, height: 36)
+            }
+            .foregroundStyle(Theme.overlayInk)
+            .accessibilityLabel("Gửi file sang PC")
             barButton(session.editing ? "Lưu keymap" : "Sửa keymap", session.editing ? "checkmark" : "square.grid.3x3") {
                 session.editing.toggle()
                 if !session.editing { session.saveKeymap() }
@@ -567,6 +591,23 @@ struct StreamView: View {
         .padding(4)
         .overlayTrack(22)
         .sheet(isPresented: $showSettings) { SettingsSheet(session: session) }
+    }
+
+    /// Ảnh, video chọn trong Thư viện ra file tạm để gửi: video nhận thẳng thành file, ảnh giữ định dạng gốc (HEIC, JPEG...).
+    private static func stage(_ items: [PhotosPickerItem]) async -> [URL] {
+        var out: [URL] = []
+        for (i, item) in items.enumerated() {
+            if item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
+                if let m = try? await item.loadTransferable(type: PickedMovie.self) { out.append(m.url) }
+            } else if let d = try? await item.loadTransferable(type: Data.self) {
+                let dir = FileManager.default.temporaryDirectory.appendingPathComponent("send-\(UUID().uuidString)", isDirectory: true)
+                let url = dir.appendingPathComponent(Files.photoName(i, ext: item.supportedContentTypes.first?.preferredFilenameExtension ?? "jpg"))
+                if (try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)) != nil, (try? d.write(to: url)) != nil {
+                    out.append(url)
+                }
+            }
+        }
+        return out
     }
 
     private func barButton(_ title: String, _ icon: String, action: @escaping () -> Void) -> some View {
@@ -602,6 +643,34 @@ struct StreamView: View {
         default:
             EmptyView()
         }
+    }
+}
+
+/// Dải gửi/nhận file: tên, tiến độ, lỗi; file nhận xong có nút Chia sẻ (lưu vào Ảnh, mở bằng app khác).
+struct TransferBadge: View {
+    let transfer: FileTransfer
+    var close: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: transfer.sending ? "arrow.up.circle" : "arrow.down.circle")
+            Text(transfer.name).lineLimit(1).truncationMode(.middle).frame(maxWidth: 200)
+            if let f = transfer.failed {
+                Text(f).foregroundStyle(.red).lineLimit(1)
+            } else if !transfer.finished {
+                ProgressView(value: transfer.progress).frame(width: 80)
+            } else if let url = transfer.saved {
+                ShareLink(item: url) { Text("Chia sẻ") }
+            } else {
+                Text("Đã gửi")
+            }
+            Button(action: close) { Image(systemName: "xmark") }.accessibilityLabel("Đóng")
+        }
+        .font(.text(12, .medium))
+        .foregroundStyle(Theme.overlayInk)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .overlayTrack(16)
     }
 }
 
@@ -727,8 +796,9 @@ struct SettingsSheet: View {
                     LabeledContent("Băng thông", value: String(format: "%.1f Mbps", session.link.mbps))
                     LabeledContent("Độ phân giải", value: session.link.size)
                     LabeledContent("Bộ mã hoá", value: session.link.enc)
+                    LabeledContent("Phiên bản app", value: AppUpdate.current)
                 } header: { Text("Kết nối") } footer: {
-                    Text("Màn hình PC đứng yên thì khung/s thấp là bình thường. Đổi độ phân giải, fps, bitrate trên cửa sổ PC.")
+                    Text("Màn hình PC đứng yên thì khung/s thấp là bình thường. Đổi độ phân giải, fps, bitrate trên cửa sổ PC. File PC gửi xuống nằm trong app Tệp > Trên iPhone > Remote Desk > Nhận từ PC; file gửi lên nằm trong thư mục Tải về" + "\\" + "Remote Desk của PC.")
                 }
                 .listRowBackground(Theme.card)
             }

@@ -16,6 +16,7 @@ struct ContentView: View {
     @State private var error: String?
     @State private var scanning = false
     @State private var scanned: URL?
+    @State private var newVersion: String?
 
     var body: some View {
         ScrollView {
@@ -74,6 +75,9 @@ struct ContentView: View {
         }
         .onOpenURL(perform: pair)  // quét bằng app Camera: iOS mở remotedesk://pair?... vào thẳng app
         .onAppear { discovery.start() }
+        .task {
+            if let v = await AppUpdate.latest(), AppUpdate.newer(v, than: AppUpdate.current) { newVersion = v }
+        }
     }
 
     /// Sân khấu: nhãn sản phẩm, tiêu đề lớn, một dòng phụ, hình thiết bị đứng giữa không có khung.
@@ -115,6 +119,7 @@ struct ContentView: View {
                 Button("Thêm bằng địa chỉ ›") { adding = true }
                     .font(.text(17)).foregroundStyle(Theme.link)
             }
+            if let newVersion { UpdateCard(version: newVersion) }
             if discovery.found.isEmpty && store.hosts.isEmpty {
                 HStack(spacing: 16) {
                     ProgressView()
@@ -182,6 +187,30 @@ struct ContentView: View {
         let s = Session(host: h, password: password, pairCode: pairCode)
         s.onHostUpdate = { store.upsert($0) }  // chỉ lưu máy chủ khi PC đã nhận đăng nhập
         active = s
+    }
+}
+
+/// Thẻ báo bản mới: tải IPA ký lại bằng Sideloadly, hoặc thêm nguồn một lần để AltStore/SideStore tự cập nhật các bản sau.
+struct UpdateCard: View {
+    let version: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Có bản mới \(version)").font(.display(19)).tracking(0.23).foregroundStyle(Theme.ink)
+            Text("Bạn đang dùng \(AppUpdate.current). Cài bằng AltStore hoặc SideStore thì thêm nguồn một lần, các bản sau tự cập nhật.")
+                .font(.text(14)).tracking(-0.22).foregroundStyle(Theme.slate)
+            HStack(spacing: 16) {
+                Link("Tải bản mới", destination: AppUpdate.page).buttonStyle(BluePill())
+                Menu("Thêm nguồn ›") {
+                    if let u = AppUpdate.addSource("altstore") { Link("AltStore", destination: u) }
+                    if let u = AppUpdate.addSource("sidestore") { Link("SideStore", destination: u) }
+                }
+                .font(.text(14)).foregroundStyle(Theme.link)
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .card()
     }
 }
 

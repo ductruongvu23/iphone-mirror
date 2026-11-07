@@ -29,6 +29,9 @@
 #include <dwmapi.h>
 #include <gdiplus.h>
 #include <winhttp.h>
+#include <commdlg.h>
+#include <shellapi.h>
+#include <shlobj.h>
 #include <wrl/client.h>
 #include <algorithm>
 #include <atomic>
@@ -1016,6 +1019,103 @@ static Qr qr_make(const string& text, int mask = -1) {
     return q;
 }
 
+// ======================= Chuyển file và cập nhật: hàm phụ =======================
+#ifndef RD_VERSION
+#define RD_VERSION "dev"  // build_host.sh đặt theo tag khi phát hành (VERSION=1.2.0)
+#endif
+// a mới hơn b? So từng số: "1.10.0" > "1.9.2", bỏ chữ v đầu. Bản tự build ("dev") không so được nên không bao giờ cập nhật.
+static bool newer(const string& a, const string& b) {
+    auto nums = [](const string& v) {
+        std::vector<int> n;
+        size_t i = v.find_first_of("0123456789");
+        while (i < v.size() && isdigit((unsigned char)v[i])) {
+            n.push_back(atoi(v.c_str() + i));
+            i = v.find_first_not_of("0123456789", i);
+            if (i >= v.size() || v[i] != '.') break;
+            i++;
+        }
+        return n;
+    };
+    auto x = nums(a), y = nums(b);
+    if (x.empty() || y.empty()) return false;
+    x.resize(std::max(x.size(), y.size())), y.resize(x.size());
+    return x > y;
+}
+struct Release { string tag, url, sha; };  // tag, link bộ cài, SHA-256 bộ cài GitHub tính sẵn
+// JSON của api.github.com/repos/.../releases/latest: tìm asset bộ cài (*-Setup.exe). Mỗi asset kết thúc bằng
+// browser_download_url, digest nằm trước nó trong cùng asset.
+static bool parse_release(const string& js, Release& r) {
+    if (!jstr(js, "tag_name", r.tag)) return false;
+    size_t from = 0;
+    for (size_t p; (p = js.find("\"browser_download_url\":", from)) != string::npos; from = p + 1) {
+        if (!jstr(js.substr(p), "browser_download_url", r.url) || !r.url.ends_with("-Setup.exe")) continue;
+        size_t d = js.rfind("\"digest\":", p);
+        string dig;
+        r.sha = d != string::npos && d >= from && jstr(js.substr(d), "digest", dig) && dig.starts_with("sha256:") ? dig.substr(7) : "";
+        return r.url.starts_with("https://github.com/");
+    }
+    return false;
+}
+// Tên file iPhone gửi lên: bỏ đường dẫn và ký tự Windows cấm, tránh tên thiết bị (CON, NUL...), không để rỗng.
+static string safe_name(string n) {
+    size_t sl = n.find_last_of("/\\");
+    if (sl != string::npos) n.erase(0, sl + 1);
+    string o;
+    for (unsigned char c : n) o += c < 32 || strchr("<>:\"|?*", c) ? '_' : (char)c;
+    while (!o.empty() && (o.back() == '.' || o.back() == ' ')) o.pop_back();
+    o.erase(0, std::min(o.find_first_not_of(' '), o.size()));
+    if (o.size() > 180) {  // giữ đuôi file, cắt đúng ranh giới ký tự UTF-8
+        size_t d = o.rfind('.');
+        string ext = d != string::npos && o.size() - d <= 10 ? o.substr(d) : "";
+        size_t k = 180 - ext.size();
+        while (k && ((unsigned char)o[k] & 0xC0) == 0x80) k--;
+        o = o.substr(0, k) + ext;
+    }
+    string stem = o.substr(0, o.find('.'));
+    std::transform(stem.begin(), stem.end(), stem.begin(), ::toupper);
+    static const char* dev[] = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+                                "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
+    for (auto x : dev) if (stem == x) o = "_" + o;
+    return o.empty() ? "file" : o;
+}
+static string url_dec(const string& s) {
+    string o;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '+') o += ' ';
+        else if (s[i] == '%' && i + 2 < s.size() && isxdigit((unsigned char)s[i + 1]) && isxdigit((unsigned char)s[i + 2]))
+            o += (char)std::stoi(s.substr(i + 1, 2), nullptr, 16), i += 2;
+        else o += s[i];
+    }
+    return o;
+}
+static string qparam(const string& q, const string& key) {  // "a=1&name=x" -> giá trị (chưa giải mã %)
+    for (size_t p = 0; p <= q.size();) {
+        size_t e = q.find('&', p);
+        if (e == string::npos) e = q.size();
+        if (q.compare(p, key.size() + 1, key + "=") == 0) return q.substr(p + key.size() + 1, e - p - key.size() - 1);
+        p = e + 1;
+    }
+    return "";
+}
+static string header(const string& req, const string& low, const string& name) {  // name viết thường
+    size_t p = low.find("\r\n" + name + ":");
+    if (p == string::npos) return "";
+    p += name.size() + 3;
+    string v = req.substr(p, req.find("\r\n", p) - p);
+    v.erase(0, std::min(v.find_first_not_of(" \t"), v.size()));
+    v.erase(v.find_last_not_of(" \t") + 1);
+    return v;
+}
+static string human(uint64_t b) {
+    const char* u[] = {"B", "KB", "MB", "GB", "TB"};
+    double v = (double)b;
+    int i = 0;
+    while (v >= 1024 && i < 4) v /= 1024, i++;
+    char s[32];
+    snprintf(s, sizeof s, i ? "%.1f %s" : "%.0f %s", v, u[i]);
+    return s;
+}
+
 // ======================= Khoá thiết bị và chống dò =======================
 // Đăng nhập đúng tài khoản thì PC cấp cho thiết bị đó một khoá 256-bit (iPhone cất trong Keychain).
 // Các lần sau thiết bị vào thẳng bằng khoá, không gửi lại mật khẩu. Đổi tài khoản hoặc "Đăng xuất hết" thì mọi khoá mất hiệu lực.
@@ -1547,6 +1647,39 @@ static string pair_url(const string& code) {
     return "remotedesk://pair?n=" + url_enc(name) + "&a=" + url_enc(a) + "&c=" + code + (f.empty() ? "" : "&f=" + f);
 }
 
+// File PC mời iPhone tải (nút "Gửi tới iPhone" hoặc kéo thả vào cửa sổ). Mã ngẫu nhiên, hết hạn sau 1 giờ;
+// không xoá sau khi tải để iPhone mất mạng giữa chừng còn tải lại được.
+struct Offer {
+    std::wstring path;
+    string name;
+    uint64_t size = 0;
+    ULONGLONG until = 0;
+};
+static std::mutex g_offmu;
+static std::map<string, Offer> g_offers;
+static bool find_offer(const string& id, Offer& o) {
+    std::lock_guard g(g_offmu);
+    auto it = g_offers.find(id);
+    if (it == g_offers.end() || GetTickCount64() > it->second.until) return false;
+    o = it->second;
+    return true;
+}
+// Thư mục nhận file từ iPhone: Tải về\Remote Desk.
+static std::filesystem::path recv_dir() {
+    PWSTR p = nullptr;
+    std::filesystem::path d = SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &p)) ? std::filesystem::path(p) / L"Remote Desk"
+                                                                                              : std::filesystem::path(g_dir) / L"Nhận từ iPhone";
+    CoTaskMemFree(p);
+    std::error_code ec;
+    std::filesystem::create_directories(d, ec);
+    return d;
+}
+static std::filesystem::path unique_path(const std::filesystem::path& dir, const string& name) {
+    std::filesystem::path f = dir / wide(name), stem = f.stem(), ext = f.extension();
+    for (int i = 1; std::filesystem::exists(f); i++) f = dir / (stem.wstring() + L" (" + std::to_wstring(i) + L")" + ext.wstring());
+    return f;
+}
+
 // ======================= Phiên điều khiển =======================
 struct Session;
 static std::mutex g_cmu;
@@ -1643,6 +1776,72 @@ struct Session {
         shutdown(t.s, SD_BOTH);
     }
 
+    // Chuyển file trên cùng cổng, mỗi file một kết nối HTTPS riêng để không chặn luồng hình:
+    //   POST /upload?name=...  iPhone gửi lên, lưu vào Tải về\Remote Desk;   GET /file?id=...  iPhone tải file PC mời gửi.
+    // Xác thực bằng khoá thiết bị (header X-Token) như lúc vào phiên, sai thì tính vào khoá IP chống dò.
+    void files(const string& req, const string& low, const string& method, const string& path, const string& query) {
+        auto reply = [&](const char* status, const string& body) {
+            string r = string("HTTP/1.1 ") + status + "\r\nContent-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+            t.send(r.data(), r.size());
+        };
+        if (auth_locked(peer)) return reply("429 Too Many Requests", R"({"error":"locked"})");
+        if (!token_ok(header(req, low, "x-token"))) {
+            auth_failed(peer);
+            return reply("401 Unauthorized", R"({"error":"token"})");
+        }
+        DWORD to = 30000;  // iPhone mất mạng giữa chừng thì bỏ, không treo luồng
+        setsockopt(t.s, SOL_SOCKET, SO_RCVTIMEO, (char*)&to, sizeof to);
+        if (method == "POST" && path == "/upload") {
+            string cl = header(req, low, "content-length");
+            if (cl.empty() || cl.size() > 15 || cl.find_first_not_of("0123456789") != string::npos)
+                return reply("411 Length Required", R"({"error":"length"})");
+            uint64_t len = std::stoull(cl), got = 0;
+            auto dst = unique_path(recv_dir(), safe_name(url_dec(qparam(query, "name"))));
+            auto part = dst;
+            part += L".part";
+            {
+                std::ofstream f(part, std::ios::binary);
+                while (f && got < len) {
+                    if (t.plain.empty() && !t.fill()) break;
+                    size_t k = (size_t)std::min<uint64_t>(t.plain.size(), len - got);
+                    f.write(t.plain.data(), k);
+                    got += k;
+                    t.plain.erase(0, k);
+                }
+                if (!f) got = UINT64_MAX;  // không ghi được (đĩa đầy)
+            }
+            std::error_code ec;
+            if (got == len) std::filesystem::rename(part, dst, ec);
+            string name = utf8(dst.filename().wstring());
+            if (got != len || ec) {
+                std::filesystem::remove(part, ec);
+                logf("Nhận \"%s\" từ iPhone không trọn vẹn, đã bỏ", name.c_str());
+                return reply("400 Bad Request", R"({"error":"incomplete"})");
+            }
+            logf("Đã nhận \"%s\" (%s) từ iPhone, lưu trong Tải về\\Remote Desk", name.c_str(), human(len).c_str());
+            return reply("200 OK", R"({"ok":true,"name":")" + jesc(name) + "\"}");
+        }
+        if (method == "GET" && path == "/file") {
+            Offer o;
+            std::ifstream f;
+            if (find_offer(qparam(query, "id"), o)) f.open(std::filesystem::path(o.path), std::ios::binary);
+            if (!f.is_open()) return reply("404 Not Found", R"({"error":"id"})");  // ifstream chưa mở thì !f vẫn là false
+            string h = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: " + std::to_string(o.size) +
+                       "\r\nConnection: close\r\n\r\n";
+            uint64_t sent = 0;
+            std::vector<char> b(1 << 16);
+            bool ok = t.send(h.data(), h.size());
+            while (ok && (f.read(b.data(), b.size()) || f.gcount())) {
+                ok = t.send(b.data(), (size_t)f.gcount());
+                if (ok) sent += f.gcount();
+            }
+            logf(sent == o.size ? "Đã gửi \"%s\" tới iPhone" : "Gửi \"%s\" tới iPhone bị ngắt giữa chừng", o.name.c_str());
+            return;
+        }
+        reply("405 Method Not Allowed", R"({"error":"method"})");
+    }
+
     void run() {
         if (!t.handshake()) return;
         size_t e;
@@ -1652,7 +1851,9 @@ struct Session {
         std::transform(low.begin(), low.end(), low.begin(), ::tolower);
         size_t sp1 = req.find(' '), sp2 = req.find(' ', sp1 + 1);
         string path = sp1 == string::npos || sp2 == string::npos ? "" : req.substr(sp1 + 1, sp2 - sp1 - 1);
+        string query = path.find('?') == string::npos ? "" : path.substr(path.find('?') + 1);
         path = path.substr(0, path.find('?'));
+        if (path == "/upload" || path == "/file") return files(req, low, req.substr(0, sp1), path, query);
         size_t kp = low.find("\r\nsec-websocket-key:");
         if (kp == string::npos || path != "/ws") {
             string body, ct = "text/html; charset=utf-8", status = "200 OK";
@@ -1761,6 +1962,94 @@ struct Session {
     }
 };
 
+// PC gửi file: báo iPhone đang kết nối, iPhone tự tải về qua GET /file. Chạy ở luồng riêng: gửi tin có thể chờ luồng hình.
+static void offer_files(std::vector<std::wstring> paths) {
+    std::lock_guard g(g_cmu);  // giữ g_current sống trong lúc gửi
+    if (!g_current) { logf("Chưa có iPhone nào đang kết nối để gửi file"); return; }
+    for (auto& p : paths) {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(p, ec)) { logf("Bỏ qua thư mục %s: chỉ gửi được file", utf8(p).c_str()); continue; }
+        Offer o{p, utf8(std::filesystem::path(p).filename().wstring()), std::filesystem::file_size(p, ec), GetTickCount64() + 3600000};
+        uint8_t r[16];
+        BCryptGenRandom(nullptr, r, sizeof r, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        string id = hexs(r, sizeof r);
+        {
+            std::lock_guard g2(g_offmu);
+            g_offers[id] = o;
+        }
+        ws_send(g_current->t, 1, R"({"t":"file","id":")" + id + R"(","name":")" + jesc(o.name) + R"(","size":)" + std::to_string(o.size) + "}");
+        logf("Đang gửi \"%s\" (%s) tới iPhone", o.name.c_str(), human(o.size).c_str());
+    }
+}
+
+// ======================= Tự cập nhật =======================
+// Kiểm GitHub Release lúc mở app (sau 1 phút) và mỗi 6 giờ. Bản cài bằng bộ cài thì tự tải bộ cài mới, kiểm SHA-256 theo
+// GitHub, rồi chạy im lặng khi không có iPhone nào đang điều khiển; bộ cài đóng app này rồi mở lại bản mới (/R).
+static const wchar_t* RELEASES = L"https://github.com/ductruongvu23/remote-desk/releases/latest";
+static std::mutex g_updmu;
+static Release g_rel;  // bản mới hơn đang có trên GitHub (tag rỗng: chưa có)
+static std::atomic<bool> g_updating{false}, g_autoupdate{true};
+static Release latest_update() {
+    std::lock_guard g(g_updmu);
+    return g_rel;
+}
+static bool installed_copy() {  // chạy từ thư mục bộ cài đã cài (không phải bản zip hay bản tự build)?
+    wchar_t b[MAX_PATH];
+    DWORD n = sizeof b;
+    return !RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RemoteDesk", L"InstallLocation",
+                         RRF_RT_REG_SZ, nullptr, b, &n) &&
+           !lstrcmpiW(b, g_dir.c_str());
+}
+static void update_now(Release r) {
+    if (g_updating.exchange(true)) return;
+    logf("Đang tải Remote Desk %s…", r.tag.c_str());
+    size_t h = r.url.find('/', 8);
+    string body = h == string::npos ? "" : https_get(wide(r.url.substr(8, h - 8)).c_str(), wide(r.url.substr(h)));
+    bool ok = r.sha.empty() ? body.size() > 200000 && body.starts_with("MZ") : sha256_hex(body) == r.sha;
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring exe = std::wstring(tmp) + L"RemoteDesk-Setup-" + wide(safe_name(r.tag)) + L".exe";
+    if (ok) ok = (bool)(std::ofstream(std::filesystem::path(exe), std::ios::binary) << body);
+    // /D phải đứng cuối và không có ngoặc kép (quy ước NSIS)
+    std::wstring args = L"/S /R /D=" + g_dir;
+    if (ok) ok = (INT_PTR)ShellExecuteW(nullptr, L"open", exe.c_str(), args.c_str(), nullptr, SW_HIDE) > 32;
+    if (ok) {
+        logf("Đang cài Remote Desk %s, app sẽ tự mở lại", r.tag.c_str());
+        return;  // bộ cài sẽ đóng app này
+    }
+    logf("Không cập nhật được lên %s (tải %s): thử lại sau", r.tag.c_str(), human(body.size()).c_str());
+    {
+        std::lock_guard g(g_updmu);
+        g_rel = {};  // lần kiểm sau (6 giờ) tìm lại
+    }
+    g_updating = false;
+}
+static void update_loop() {
+    if (!newer(RD_VERSION, "0")) return;  // bản tự build: không có số phiên bản để so
+    auto next = Clock::now() + std::chrono::minutes(1);
+    for (;; Sleep(60000)) {
+        if (Clock::now() >= next) {
+            Release r;
+            bool got = parse_release(https_get(L"api.github.com", L"/repos/ductruongvu23/remote-desk/releases/latest"), r);
+            next = Clock::now() + (got ? std::chrono::hours(6) : std::chrono::minutes(30));
+            if (got && newer(r.tag, RD_VERSION) && latest_update().tag != r.tag) {
+                {
+                    std::lock_guard g(g_updmu);
+                    g_rel = r;
+                }
+                logf("Có bản mới Remote Desk %s (đang dùng %s)", r.tag.c_str(), RD_VERSION);
+            }
+        }
+        Release r = latest_update();
+        bool idle;
+        {
+            std::lock_guard g(g_cmu);
+            idle = !g_current;
+        }
+        if (!r.tag.empty() && g_autoupdate && idle && installed_copy()) update_now(r);
+    }
+}
+
 static void client_thread(SOCKET s) {
     DWORD to = 10000;
     BOOL nd = TRUE;
@@ -1806,7 +2095,7 @@ static bool setup_tls(const std::wstring& cn, bool& created) {
 // ======================= Giao diện Windows: kiểu "white gallery" của Apple, có bản tối =======================
 // Nền trắng/#f5f5f7, chữ Ink, thẻ bo 28 px không bóng, nút pill viền mảnh, phân đoạn kiểu Apple.
 // Theo chế độ sáng/tối của Windows (App mode) và tự đổi khi người dùng đổi.
-enum { ID_ACCOUNT = 101, ID_KICK, ID_FORGET, ID_ACC_SAVE, ID_ACC_CANCEL, ID_PAIR, ID_DDNS, ID_ACC_EDIT = 120, ID_SEG = 200 };  // phân đoạn: ID_SEG + nhóm*10 + vị trí
+enum { ID_ACCOUNT = 101, ID_KICK, ID_FORGET, ID_ACC_SAVE, ID_ACC_CANCEL, ID_PAIR, ID_DDNS, ID_SEND, ID_RECVDIR, ID_UPDATE, ID_ACC_EDIT = 120, ID_SEG = 200 };  // phân đoạn: ID_SEG + nhóm*10 + vị trí
 static const int RES_W[] = {1280, 1920, 2560, 0}, FPS_V[] = {30, 60, 90, 120}, RATE_V[] = {5, 10, 20, 30, 50};
 static DNS_SERVICE_REGISTER_REQUEST g_reg{};
 
@@ -1826,6 +2115,7 @@ static void load_settings() {
     g_fps = FPS_V[pick(FPS_V, 4, GetPrivateProfileIntW(L"stream", L"fps", 60, ini.c_str()), 1)];
     g_mbps = RATE_V[pick(RATE_V, 5, GetPrivateProfileIntW(L"stream", L"mbps", 20, ini.c_str()), 2)];
     g_hevc = GetPrivateProfileIntW(L"stream", L"hevc", 1, ini.c_str()) != 0;
+    g_autoupdate = GetPrivateProfileIntW(L"app", L"autoupdate", 1, ini.c_str()) != 0;  // 0: chỉ báo, không tự cài
     g_remote = GetPrivateProfileIntW(L"net", L"remote", 0, ini.c_str()) != 0;
     wchar_t b[300];
     GetPrivateProfileStringW(L"net", L"ddns", L"", b, 300, ini.c_str());
@@ -1883,14 +2173,15 @@ enum Font { F_KICKER, F_LIVE, F_HEAD, F_BODY, F_SMALL, F_BIG, F_TITLE, F_COUNT }
 static HFONT g_font[F_COUNT];
 
 // Bố cục theo 96 DPI. Dải #f5f5f7 từ BAND_Y; hai thẻ trắng bo 28 px.
-constexpr int WIN_W = 520, WIN_H = 896, BAND_Y = 300, TRACK_X = 196, TRACK_W = 280, SEG_H = 30;
-static const RECT CARD_Q = {20, 320, 500, 540}, CARD_NET = {20, 556, 500, 726}, CARD_LOG = {20, 742, 500, 880};
+constexpr int WIN_W = 520, WIN_H = 976, BAND_Y = 300, TRACK_X = 196, TRACK_W = 280, SEG_H = 30;
+static const RECT CARD_Q = {20, 320, 500, 540}, CARD_NET = {20, 556, 500, 726}, CARD_FILE = {20, 742, 500, 806},
+                  CARD_LOG = {20, 822, 500, 960};
 static const int ROW_Y[4] = {384, 422, 460, 498}, NET_Y = 618;
 struct Ctl { HWND h; int x, y, w, h_; Font font; Role fg, bg; HWND parent; };  // fg = R_BLUE: nút chính tô xanh
 struct Seg { HWND h; int grp, idx, n, x, w, y; };  // rãnh phân đoạn của nhóm: x, w, y theo 96 DPI
 static std::vector<Ctl> g_ctls;
 static std::vector<Seg> g_segs;
-static HWND h_kicker, h_live, h_status, h_detail, h_acct, h_accbtn, h_kick, h_log, h_net, h_ddns;
+static HWND h_kicker, h_live, h_status, h_detail, h_acct, h_accbtn, h_kick, h_log, h_net, h_ddns, h_send, h_upd;
 static HWND g_dlg, h_dlgerr;  // hộp tạo/đổi tài khoản, tên miền, mã QR
 static void (*g_dlg_save)(HWND);  // nút Lưu / phím Enter của hộp có ô nhập
 static std::vector<HWND> g_dlg_edits;
@@ -2071,7 +2362,7 @@ static void paint(HWND h) {
         FillRect(m, &band, g_brush[R_BAND]);
         Gdiplus::Graphics g(m);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        for (const RECT& c : {CARD_Q, CARD_NET, CARD_LOG})
+        for (const RECT& c : {CARD_Q, CARD_NET, CARD_FILE, CARD_LOG})
             rrect(g, (float)S(c.left), (float)S(c.top), (float)S(c.right - c.left), (float)S(c.bottom - c.top), (float)S(28), P[R_CARD]);
     });
 }
@@ -2111,6 +2402,7 @@ static void refresh_status() {
         ShowWindow(h_kicker, live ? SW_HIDE : SW_SHOW);
         ShowWindow(h_live, live ? SW_SHOW : SW_HIDE);
         EnableWindow(h_kick, live);
+        EnableWindow(h_send, live);
     }
     set_text(h_status, live ? L"Đang phát tới iPhone." : L"Sẵn sàng kết nối.");
     set_text(h_detail, detail);
@@ -2121,6 +2413,9 @@ static void refresh_status() {
     }
     set_text(h_net, wide(net) + L"  ·  " + std::to_wstring(device_count()) + L" thiết bị đã đăng nhập");
     set_text(h_acct, acc ? wide(account_user()) : L"Chưa tạo");
+    Release up = latest_update();
+    ShowWindow(h_upd, up.tag.empty() && !g_updating ? SW_HIDE : SW_SHOW);
+    set_text(h_upd, g_updating ? L"Đang cập nhật…" : L"Cập nhật lên " + wide(up.tag));
     string dn = ddns_name();
     set_text(h_ddns, dn.empty() ? L"Chưa đặt" : wide(dn));
     set_text(h_accbtn, acc ? L"Đổi tài khoản" : L"Tạo tài khoản");
@@ -2390,6 +2685,19 @@ static void pair_dialog() {
     run_modal(done);
 }
 
+static std::vector<std::wstring> pick_files() {
+    std::vector<wchar_t> buf(1 << 16);
+    OPENFILENAMEW o{sizeof o};
+    o.hwndOwner = g_hwnd, o.lpstrFile = buf.data(), o.nMaxFile = (DWORD)buf.size(), o.lpstrTitle = L"Chọn file gửi tới iPhone";
+    o.Flags = OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&o)) return {};
+    std::wstring dir = buf.data();  // nhiều file: thư mục rồi từng tên, ngăn bằng \0; một file: đường dẫn đầy đủ
+    std::vector<std::wstring> v;
+    for (const wchar_t* f = buf.data() + dir.size() + 1; *f; f += wcslen(f) + 1) v.push_back(dir + L"\\" + f);
+    if (v.empty()) v.push_back(dir);
+    return v;
+}
+
 static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_APP_LOG: append_logs(); return 0;
@@ -2407,6 +2715,14 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             pair_dialog();
         } else if (LOWORD(wp) == ID_DDNS) {
             ddns_dialog();
+        } else if (LOWORD(wp) == ID_SEND) {
+            auto f = pick_files();
+            if (!f.empty()) std::thread(offer_files, f).detach();
+        } else if (LOWORD(wp) == ID_RECVDIR) {
+            ShellExecuteW(h, L"open", recv_dir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        } else if (LOWORD(wp) == ID_UPDATE) {  // bản zip/tự build: mở trang tải; bản đã cài: cập nhật ngay
+            if (installed_copy()) std::thread(update_now, latest_update()).detach();
+            else ShellExecuteW(h, L"open", RELEASES, nullptr, nullptr, SW_SHOWNORMAL);
         } else if (LOWORD(wp) == ID_FORGET) {
             forget_devices();
             logf("Đã đăng xuất mọi thiết bị: lần sau phải nhập mật khẩu");
@@ -2415,6 +2731,18 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_current) g_current->kick(4001, "PC đã ngắt kết nối");
         } else if (LOWORD(wp) >= ID_SEG && HIWORD(wp) == BN_CLICKED) apply_setting((LOWORD(wp) - ID_SEG) / 10, (LOWORD(wp) - ID_SEG) % 10);
         return 0;
+    case WM_DROPFILES: {  // kéo file vào cửa sổ: gửi tới iPhone
+        HDROP d = (HDROP)wp;
+        std::vector<std::wstring> f;
+        for (UINT i = 0, n = DragQueryFileW(d, 0xFFFFFFFF, nullptr, 0); i < n; i++) {
+            std::wstring b(DragQueryFileW(d, i, nullptr, 0) + 1, 0);
+            b.resize(DragQueryFileW(d, i, b.data(), (UINT)b.size()));
+            f.push_back(b);
+        }
+        DragFinish(d);
+        std::thread(offer_files, f).detach();
+        return 0;
+    }
     case WM_SETTINGCHANGE:
         if (lp && !wcscmp((const wchar_t*)lp, L"ImmersiveColorSet")) apply_theme();  // người dùng đổi sáng/tối
         break;
@@ -2460,8 +2788,11 @@ static void run_ui() {
     g_sel[3] = g_hevc, g_sel[4] = g_remote;
 
     // Phần trên, nền trắng: nhãn, tiêu đề lớn, một dòng phụ, tên tài khoản là "sản phẩm" ở giữa sân khấu
-    h_kicker = label(L"Remote Desk", 40, 30, 440, 26, F_KICKER, R_INK, R_CANVAS);
-    h_live = label(L"TRỰC TIẾP", 40, 36, 440, 18, F_LIVE, R_ORANGE, R_CANVAS);
+    std::wstring ver = newer(RD_VERSION, "0") ? L"Remote Desk " + wide(RD_VERSION) : L"Remote Desk";
+    h_kicker = label(ver.c_str(), 40, 30, 250, 26, F_KICKER, R_INK, R_CANVAS);
+    h_live = label(L"TRỰC TIẾP", 40, 36, 250, 18, F_LIVE, R_ORANGE, R_CANVAS);
+    h_upd = ctl(L"BUTTON", L"", WS_TABSTOP | BS_OWNERDRAW, 300, 26, 180, 30, ID_UPDATE, F_SMALL, R_BLUE, R_CANVAS);
+    ShowWindow(h_upd, SW_HIDE);
     ShowWindow(h_live, SW_HIDE);
     h_status = label(L"", 40, 60, 440, 46, F_HEAD, R_INK, R_CANVAS);
     h_detail = label(L"", 40, 108, 440, 22, F_BODY, R_SLATE, R_CANVAS, SS_LEFT | SS_ENDELLIPSIS);
@@ -2488,14 +2819,21 @@ static void run_ui() {
     ctl(L"BUTTON", L"Đặt tên miền", WS_TABSTOP | BS_OWNERDRAW, 352, 656, 124, 30, ID_DDNS, F_SMALL, R_INK, R_CARD);
     h_net = label(L"", 48, 698, 424, 20, F_SMALL, R_SLATE, R_CARD, SS_LEFT | SS_ENDELLIPSIS);
 
-    label(L"Nhật ký", 48, 762, 400, 26, F_TITLE, R_INK, R_CARD);
-    h_log = ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 48, 794, 424, 74, 0, F_SMALL, R_SLATE, R_CARD);
+    // Thẻ chuyển file: gửi tới iPhone đang kết nối (hoặc kéo file vào cửa sổ), file iPhone gửi lên nằm trong Tải về\Remote Desk
+    label(L"Chuyển file", 48, 760, 140, 26, F_TITLE, R_INK, R_CARD);
+    h_send = ctl(L"BUTTON", L"Gửi tới iPhone", WS_TABSTOP | BS_OWNERDRAW, 196, 758, 140, 30, ID_SEND, F_SMALL, R_INK, R_CARD);
+    EnableWindow(h_send, FALSE);
+    ctl(L"BUTTON", L"Thư mục nhận", WS_TABSTOP | BS_OWNERDRAW, 352, 758, 124, 30, ID_RECVDIR, F_SMALL, R_INK, R_CARD);
+
+    label(L"Nhật ký", 48, 842, 400, 26, F_TITLE, R_INK, R_CARD);
+    h_log = ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 48, 874, 424, 74, 0, F_SMALL, R_SLATE, R_CARD);
 
     layout();
     apply_theme();
     append_logs();
     refresh_status();
     SetTimer(g_hwnd, 1, 1000, nullptr);
+    DragAcceptFiles(g_hwnd, TRUE);
     ShowWindow(g_hwnd, SW_SHOW);
     if (!has_account()) account_dialog();  // lần đầu chạy: tạo tài khoản ngay
     MSG m;
@@ -2582,6 +2920,32 @@ static int self_test() {
         CHECK(!token_ok(tk) && device_count() == 0);
         DeleteFileW(g_devfile.c_str());
     }
+    // Cập nhật: so phiên bản, đọc JSON Release (dạng có khoảng trắng như api.github.com trả về), lấy đúng asset bộ cài
+    CHECK(newer("v1.10.0", "1.9.2") && newer("1.2", "1.1.9") && !newer("1.2.0", "1.2") && !newer("1.1.1", "v1.2.0") && !newer("1.0", "dev") &&
+          !newer("dev", "0") && newer("1.2.0", "0"));
+    {
+        string js = R"({"tag_name": "v1.2.0", "assets": [
+          {"name": "RemoteDesk-iOS-v1.2.0-unsigned.ipa", "digest": "sha256:aa", "browser_download_url": "https://github.com/a/b/x.ipa"},
+          {"name": "RemoteDesk-Windows-v1.2.0-Setup.exe", "uploader": {"login": "x"}, "digest": "sha256:bb",
+           "browser_download_url": "https://github.com/a/b/releases/download/v1.2.0/RemoteDesk-Windows-v1.2.0-Setup.exe"}]})";
+        Release r;
+        CHECK(parse_release(js, r) && r.tag == "v1.2.0" && r.sha == "bb" && r.url.ends_with("v1.2.0-Setup.exe"));
+        string nodig = R"({"tag_name":"v2","assets":[{"digest":"sha256:aa","browser_download_url":"https://github.com/x.ipa"},
+                          {"browser_download_url":"https://github.com/y-Setup.exe"}]})";
+        CHECK(parse_release(nodig, r) && r.sha.empty() && !parse_release(R"({"tag_name":"v3","assets":[]})", r) &&
+              !parse_release(R"({"tag_name":"v3","assets":[{"browser_download_url":"http://evil/x-Setup.exe"}]})", r));
+    }
+    // Chuyển file: tên an toàn, đọc query/header
+    CHECK(safe_name("../../Windows/a.txt") == "a.txt" && safe_name("C:\\x\\b:c?.jpg") == "b_c_.jpg" && safe_name("con.txt") == "_con.txt" &&
+          safe_name(" ..") == "file" && safe_name("ảnh đẹp.heic") == "ảnh đẹp.heic" && safe_name(string(300, 'a') + ".mp4").size() == 180 &&
+          safe_name(string(300, 'a') + ".mp4").ends_with(".mp4"));
+    CHECK(url_dec("%E1%BA%A3nh+1%2Fx.jpg") == "ảnh 1/x.jpg" && qparam("a=1&name=x%20y&id=z", "name") == "x%20y" && qparam("a=1", "id").empty());
+    {
+        string rq = "POST /upload HTTP/1.1\r\nX-Token:  abc \r\nContent-Length: 12\r\n", lw = rq;
+        std::transform(lw.begin(), lw.end(), lw.begin(), ::tolower);
+        CHECK(header(rq, lw, "x-token") == "abc" && header(rq, lw, "content-length") == "12" && header(rq, lw, "range").empty());
+    }
+    CHECK(human(512) == "512 B" && human(1536) == "1.5 KB" && human(3u << 20) == "3.0 MB");
     // Mã QR: khớp đúng từng ô với thư viện qrcode của Python (phiên bản 1, mask 2); link ghép mã hoá đúng
     {
         static const uint32_t want[21] = {0x1FC07F, 0x104341, 0x17545D, 0x17575D, 0x175B5D, 0x105141, 0x1FD57F,
@@ -2732,6 +3096,7 @@ int main(int argc, char** argv) {
         logf("%s: https://%s:%d", is_tailscale(ip) ? "Tailscale (ở ngoài)" : "Safari trong mạng nhà", ip.c_str(), g_port);
     mdns_register();
     std::thread(remote_loop).detach();
+    std::thread(update_loop).detach();
     std::thread([l] { for (SOCKET s; (s = accept(l, nullptr, nullptr)) != INVALID_SOCKET;) std::thread(client_thread, s).detach(); }).detach();
     run_ui();
     ExitProcess(0);  // các phiên đang chạy dở: thoát luôn
