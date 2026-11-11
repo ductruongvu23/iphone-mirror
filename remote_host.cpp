@@ -2395,8 +2395,10 @@ static VOID WINAPI rfb_resolved(DWORD st, PVOID, PDNS_SERVICE_INSTANCE in) {
         char b[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, in->ip4Address, b, sizeof b);
         string name = in->pszInstanceName ? utf8(in->pszInstanceName) : "iPhone";
-        std::lock_guard g(g_rfbmu);
-        g_rfb_addr = string(b) + ":" + std::to_string(in->wPort), g_rfb_name = name.substr(0, name.find("._rfb."));
+        name = name.substr(0, name.find("._rfb."));
+        std::lock_guard g(g_rfbmu);  // máy khác cũng quảng bá VNC (Mac bật Chia sẻ màn hình...): ưu tiên tên TrollVNC
+        if (name.find("TrollVNC") != string::npos || g_rfb_name.find("TrollVNC") == string::npos)
+            g_rfb_addr = string(b) + ":" + std::to_string(in->wPort), g_rfb_name = name;
     }
     if (in) DnsServiceFreeInstance(in);
 }
