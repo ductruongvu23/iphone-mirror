@@ -32,6 +32,8 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <wincodec.h>
+#include <zlib.h>  // thư viện tĩnh của MSYS2 (libz.a), không cần DLL đi kèm
 #include <wrl/client.h>
 #include <algorithm>
 #include <atomic>
@@ -42,6 +44,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -1523,25 +1526,39 @@ static string public_ip() {
     if (p != string::npos) ip = body.substr(p + 4, body.find('\n', p + 4) - p - 4);
     return ip.find_first_not_of("0123456789.") == string::npos ? ip : "";  // chỉ nhận IPv4
 }
-// Thử nối TCP (chờ tối đa 3 giây). Từ PC nối vào IP công khai của chính nhà mình chỉ thông khi modem đã chuyển cổng
-// và hỗ trợ NAT vòng (hairpin): thông là chắc chắn mở, không thông thì chưa chắc.
-static bool port_open(const string& ip, int port) {
-    sockaddr_in a{};
-    a.sin_family = AF_INET, a.sin_port = htons((u_short)port);
-    if (inet_pton(AF_INET, ip.c_str(), &a.sin_addr) != 1) return false;
+static SOCKET tcp_connect(const string& host, int port, int ms) {
+    addrinfo hints{}, *ai = nullptr;
+    hints.ai_family = AF_INET, hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &ai) || !ai) return INVALID_SOCKET;
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     u_long nb = 1;
     ioctlsocket(s, FIONBIO, &nb);
-    connect(s, (sockaddr*)&a, sizeof a);
+    connect(s, ai->ai_addr, (int)ai->ai_addrlen);
+    freeaddrinfo(ai);
     fd_set w, e;
     FD_ZERO(&w);  // FD_* là macro do{...}while(0): không nối bằng dấu phẩy được
     FD_ZERO(&e);
     FD_SET(s, &w);
     FD_SET(s, &e);
-    timeval tv{3, 0};
-    bool ok = select(0, nullptr, &w, &e, &tv) == 1 && FD_ISSET(s, &w);
+    timeval tv{ms / 1000, ms % 1000 * 1000};
+    if (select(0, nullptr, &w, &e, &tv) != 1 || !FD_ISSET(s, &w)) {
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    nb = 0;
+    ioctlsocket(s, FIONBIO, &nb);
+    BOOL nd = TRUE;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&nd, sizeof nd);
+    return s;
+}
+
+// Thử nối TCP (chờ tối đa 3 giây). Từ PC nối vào IP công khai của chính nhà mình chỉ thông khi modem đã chuyển cổng
+// và hỗ trợ NAT vòng (hairpin): thông là chắc chắn mở, không thông thì chưa chắc.
+static bool port_open(const string& ip, int port) {
+    SOCKET s = tcp_connect(ip, port, 3000);
+    if (s == INVALID_SOCKET) return false;
     closesocket(s);
-    return ok;
+    return true;
 }
 // Tên miền riêng (DDNS): iPhone ở xa vào bằng tên cố định kể cả khi nhà đổi IP, không cần quét mã QR.
 // Tên *.duckdns.org có token thì PC tự báo IP mới cho DuckDNS (miễn phí; chỉ là DNS, hình và điều khiển vẫn đi thẳng).
@@ -2169,7 +2186,7 @@ static bool setup_tls(const std::wstring& cn, bool& created) {
 // ======================= Giao diện Windows: kiểu "white gallery" của Apple, có bản tối =======================
 // Nền trắng/#f5f5f7, chữ Ink, thẻ bo 28 px không bóng, nút pill viền mảnh, phân đoạn kiểu Apple.
 // Theo chế độ sáng/tối của Windows (App mode) và tự đổi khi người dùng đổi.
-enum { ID_ACCOUNT = 101, ID_KICK, ID_FORGET, ID_ACC_SAVE, ID_ACC_CANCEL, ID_PAIR, ID_DDNS, ID_SEND, ID_RECVDIR, ID_UPDATE, ID_ACC_EDIT = 120, ID_SEG = 200 };  // phân đoạn: ID_SEG + nhóm*10 + vị trí
+enum { ID_ACCOUNT = 101, ID_KICK, ID_FORGET, ID_ACC_SAVE, ID_ACC_CANCEL, ID_PAIR, ID_DDNS, ID_SEND, ID_RECVDIR, ID_UPDATE, ID_VNC, ID_ACC_EDIT = 120, ID_SEG = 200 };  // phân đoạn: ID_SEG + nhóm*10 + vị trí
 static DNS_SERVICE_REGISTER_REQUEST g_reg{};
 
 static std::wstring wide(const string& s) {
@@ -2177,6 +2194,249 @@ static std::wstring wide(const string& s) {
     MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), (int)w.size());
     return w;
 }
+// ======================= Điều khiển iPhone qua TrollVNC (RFB): phần lõi =======================
+// TrollVNC chạy trên iPhone đã jailbreak (LibVNCServer 0.9.15, cổng 5901, quảng bá _rfb._tcp qua Bonjour).
+// Xin mã hoá Tight + JPEG: đo trên iPhone 11 Pro Max qua Wi‑Fi được ~25 khung/s toàn màn (112 KB/khung); chỉ zlib thì
+// ~2,6 khung/s. Chuột trái = chạm, chuột phải = nút Home, chuột giữa = nút nguồn (quy ước của TrollVNC).
+using ReadFn = std::function<bool(void*, size_t)>;
+
+// Độ dài kiểu "compact" của Tight: 1–3 byte, mỗi byte 7 bit (byte thứ ba đủ 8 bit).
+static bool tight_len(const ReadFn& rd, uint32_t& n) {
+    n = 0;
+    for (int i = 0; i < 3; i++) {
+        uint8_t b;
+        if (!rd(&b, 1)) return false;
+        n |= (uint32_t)(i < 2 ? b & 0x7F : b) << (7 * i);
+        if (i < 2 && !(b & 0x80)) break;
+    }
+    return true;
+}
+
+// Giải mã Tight. Bốn luồng zlib dùng tiếp suốt phiên (máy chủ chỉ reset khi báo), ô ảnh chụp/game là JPEG.
+struct Tight {
+    z_stream zs[4]{};
+    bool live[4]{};
+    ComPtr<IWICImagingFactory> wic;
+    ~Tight() {
+        for (int i = 0; i < 4; i++) if (live[i]) inflateEnd(&zs[i]);
+    }
+    bool unzip(int id, const std::vector<uint8_t>& in, uint8_t* out, size_t size) {
+        z_stream& z = zs[id];
+        if (!live[id]) {
+            z = {};
+            if (inflateInit(&z) != Z_OK) return false;
+            live[id] = true;
+        }
+        z.next_in = (Bytef*)in.data(), z.avail_in = (uInt)in.size();
+        size_t got = 0;
+        while (z.avail_in) {  // sau dữ liệu còn dấu đồng bộ (00 00 FF FF): phải đọc hết nhưng không được ra thêm byte nào
+            uint8_t sink;
+            bool full = got == size;
+            z.next_out = full ? &sink : out + got, z.avail_out = full ? 1 : (uInt)(size - got);
+            uInt before = z.avail_out;
+            int r = inflate(&z, Z_SYNC_FLUSH);
+            if (full && z.avail_out != before) return false;
+            got += before - z.avail_out;
+            if (r == Z_STREAM_END || r == Z_BUF_ERROR) break;
+            if (r != Z_OK) return false;
+        }
+        return got == size;
+    }
+    bool jpeg(const std::vector<uint8_t>& j, int w, int h, uint32_t* out) {
+        if (!wic && FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)))) return false;
+        ComPtr<IWICStream> st;
+        ComPtr<IWICBitmapDecoder> dec;
+        ComPtr<IWICBitmapFrameDecode> fr;
+        ComPtr<IWICFormatConverter> cv;
+        UINT fw = 0, fh = 0;
+        return SUCCEEDED(wic->CreateStream(&st)) && SUCCEEDED(st->InitializeFromMemory((BYTE*)j.data(), (DWORD)j.size())) &&
+               SUCCEEDED(wic->CreateDecoderFromStream(st.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &dec)) &&
+               SUCCEEDED(dec->GetFrame(0, &fr)) && SUCCEEDED(fr->GetSize(&fw, &fh)) && (int)fw == w && (int)fh == h &&
+               SUCCEEDED(wic->CreateFormatConverter(&cv)) &&
+               SUCCEEDED(cv->Initialize(fr.Get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0,
+                                        WICBitmapPaletteTypeCustom)) &&
+               SUCCEEDED(cv->CopyPixels(nullptr, w * 4, w * h * 4, (BYTE*)out));
+    }
+    // Một ô w×h ra out (BGRX). Điểm ảnh 3 byte theo thứ tự R, G, B (định dạng 32 bit, sâu 24 bit).
+    bool rect(const ReadFn& rd, int w, int h, std::vector<uint32_t>& out) {
+        auto px = [](const uint8_t* p) { return 0xFF000000u | p[0] << 16 | p[1] << 8 | p[2]; };
+        uint8_t cc;
+        if (!rd(&cc, 1)) return false;
+        for (int i = 0; i < 4; i++)
+            if ((cc >> i & 1) && live[i]) inflateEnd(&zs[i]), live[i] = false;
+        cc >>= 4;
+        out.assign((size_t)w * h, 0);
+        uint32_t n;
+        if (cc == 8) {  // cả ô một màu
+            uint8_t c[3];
+            if (!rd(c, 3)) return false;
+            std::fill(out.begin(), out.end(), px(c));
+            return true;
+        }
+        if (cc == 9) {
+            if (!tight_len(rd, n) || n > (32u << 20)) return false;
+            std::vector<uint8_t> j(n);
+            return rd(j.data(), n) && jpeg(j, w, h, out.data());
+        }
+        if (cc > 9) return false;  // 0x0A là PNG của TightPNG: không xin
+        uint8_t filter = 0;
+        if ((cc & 4) && !rd(&filter, 1)) return false;
+        std::vector<uint32_t> pal;
+        int bits = 24;
+        if (filter == 1) {
+            uint8_t k;
+            if (!rd(&k, 1)) return false;
+            std::vector<uint8_t> p((k + 1) * 3);
+            if (!rd(p.data(), p.size())) return false;
+            for (size_t i = 0; i < p.size(); i += 3) pal.push_back(px(&p[i]));
+            bits = pal.size() == 2 ? 1 : 8;
+        } else if (filter > 2) {
+            return false;
+        }
+        size_t row = bits == 24 ? (size_t)w * 3 : ((size_t)w * bits + 7) / 8, size = row * h;
+        std::vector<uint8_t> d(size);
+        if (size < 12) {  // dưới 12 byte thì gửi thẳng, không nén
+            if (!rd(d.data(), size)) return false;
+        } else {
+            if (!tight_len(rd, n) || n > (32u << 20)) return false;
+            std::vector<uint8_t> z(n);
+            if (!rd(z.data(), n) || !unzip(cc & 3, z, d.data(), size)) return false;
+        }
+        if (filter == 1) {
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++) {
+                    size_t i = bits == 1 ? d[y * row + x / 8] >> (7 - x % 8) & 1 : d[y * row + x];
+                    if (i >= pal.size()) return false;
+                    out[(size_t)y * w + x] = pal[i];
+                }
+        } else if (filter == 2) {  // gradient: mỗi điểm = dự đoán (trái + trên − trên trái, kẹp 0..255) + phần dư
+            std::vector<uint8_t> prev((size_t)w * 3, 0), cur((size_t)w * 3);
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++)
+                    for (int c = 0; c < 3; c++) {
+                        int est = x ? std::clamp(prev[x * 3 + c] + cur[(x - 1) * 3 + c] - prev[(x - 1) * 3 + c], 0, 255) : prev[c];
+                        cur[x * 3 + c] = (uint8_t)(est + d[y * row + x * 3 + c]);
+                    }
+                for (int x = 0; x < w; x++) out[(size_t)y * w + x] = px(&cur[x * 3]);
+                prev.swap(cur);
+            }
+        } else {
+            for (size_t i = 0; i < (size_t)w * h; i++) out[i] = px(&d[i * 3]);
+        }
+        return true;
+    }
+};
+
+// Xác thực VNC cổ điển: mã DES 16 byte thử thách bằng mật khẩu (tối đa 8 ký tự, mỗi byte đảo thứ tự bit).
+static bool vnc_auth(const string& pass, const uint8_t ch[16], uint8_t out[16]) {
+    uint8_t key[8] = {};
+    for (size_t i = 0; i < 8 && i < pass.size(); i++)
+        for (int b = 0; b < 8; b++) key[i] |= ((uint8_t)pass[i] >> b & 1) << (7 - b);
+    BCRYPT_ALG_HANDLE a;
+    BCRYPT_KEY_HANDLE k;
+    ULONG n = 0;
+    if (BCryptOpenAlgorithmProvider(&a, BCRYPT_DES_ALGORITHM, nullptr, 0)) return false;
+    bool ok = !BCryptSetProperty(a, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_ECB, sizeof BCRYPT_CHAIN_MODE_ECB, 0) &&
+              !BCryptGenerateSymmetricKey(a, &k, nullptr, 0, key, 8, 0);
+    if (ok) {
+        ok = !BCryptEncrypt(k, (PUCHAR)ch, 16, nullptr, nullptr, 0, out, 16, &n, 0) && n == 16;
+        BCryptDestroyKey(k);
+    }
+    BCryptCloseAlgorithmProvider(a, 0);
+    return ok;
+}
+
+// Phím PC -> keysym X11. Chữ gửi dạng thường, Shift gửi riêng như phím thật: TrollVNC đổi keysym ra phím HID gốc
+// (':' thành phím ';'), không tự thêm Shift. Ctrl -> Command để Ctrl+C/V/A trên PC thành ⌘C/V/A trên iPhone.
+static uint32_t vnc_keysym(UINT vk) {
+    if ((vk >= '0' && vk <= '9') || vk == VK_SPACE) return vk;
+    if (vk >= 'A' && vk <= 'Z') return vk + 32;
+    if (vk >= VK_F1 && vk <= VK_F24) return 0xFFBE + (vk - VK_F1);
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) return '0' + (vk - VK_NUMPAD0);
+    switch (vk) {
+    case VK_BACK: return 0xFF08;
+    case VK_TAB: return 0xFF09;
+    case VK_RETURN: return 0xFF0D;
+    case VK_ESCAPE: return 0xFF1B;
+    case VK_DELETE: return 0xFFFF;
+    case VK_INSERT: return 0xFF63;
+    case VK_HOME: return 0xFF50;
+    case VK_END: return 0xFF57;
+    case VK_PRIOR: return 0xFF55;
+    case VK_NEXT: return 0xFF56;
+    case VK_LEFT: return 0xFF51;
+    case VK_UP: return 0xFF52;
+    case VK_RIGHT: return 0xFF53;
+    case VK_DOWN: return 0xFF54;
+    case VK_SHIFT: return 0xFFE1;
+    case VK_CONTROL: return 0xFFEB;  // Super = Command
+    case VK_MENU: return 0xFFE9;     // Alt = Option
+    case VK_CAPITAL: return 0xFFE5;
+    case VK_OEM_1: return ';';
+    case VK_OEM_PLUS: return '=';
+    case VK_OEM_COMMA: return ',';
+    case VK_OEM_MINUS: return '-';
+    case VK_OEM_PERIOD: return '.';
+    case VK_OEM_2: return '/';
+    case VK_OEM_3: return '`';
+    case VK_OEM_4: return '[';
+    case VK_OEM_5: return '\\';
+    case VK_OEM_6: return ']';
+    case VK_OEM_7: return '\'';
+    }
+    return 0;
+}
+
+// Tìm iPhone đang bật TrollVNC trong mạng nhà (Bonjour _rfb._tcp), để không phải gõ IP. Giữ kết quả mới nhất.
+static std::mutex g_rfbmu;
+static string g_rfb_addr, g_rfb_name;
+static VOID WINAPI rfb_resolved(DWORD st, PVOID, PDNS_SERVICE_INSTANCE in) {
+    if (!st && in && in->ip4Address) {
+        char b[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, in->ip4Address, b, sizeof b);
+        string name = in->pszInstanceName ? utf8(in->pszInstanceName) : "iPhone";
+        std::lock_guard g(g_rfbmu);
+        g_rfb_addr = string(b) + ":" + std::to_string(in->wPort), g_rfb_name = name.substr(0, name.find("._rfb."));
+    }
+    if (in) DnsServiceFreeInstance(in);
+}
+static VOID WINAPI rfb_found(DWORD st, PVOID, PDNS_RECORD r) {
+    for (auto p = (PDNS_RECORDW)r; !st && p; p = p->pNext)  // API này luôn trả chuỗi Unicode
+        if (p->wType == DNS_TYPE_PTR && p->dwTtl) {  // TTL 0 là dịch vụ vừa tắt
+            // shortcut: yêu cầu phân giải không giải phóng (vài chục byte mỗi lần thấy iPhone), đủ cho app chạy cả ngày
+            struct Rq { DNS_SERVICE_RESOLVE_REQUEST q; DNS_SERVICE_CANCEL c; };
+            auto* rq = new Rq{{DNS_QUERY_REQUEST_VERSION1, 0, _wcsdup(p->Data.PTR.pNameHost), rfb_resolved, nullptr}, {}};
+            DnsServiceResolve(&rq->q, &rq->c);
+        }
+    if (r) DnsRecordListFree(r, DnsFreeRecordList);
+}
+static void rfb_browse() {
+    static DNS_SERVICE_BROWSE_REQUEST q{};
+    static DNS_SERVICE_CANCEL c;
+    q.Version = DNS_QUERY_REQUEST_VERSION1, q.QueryName = L"_rfb._tcp.local", q.pBrowseCallback = rfb_found;
+    if (DnsServiceBrowse(&q, &c) != DNS_REQUEST_PENDING) logf("Không dò được iPhone (TrollVNC) qua Bonjour; nhập địa chỉ bằng tay");
+}
+
+// Mật khẩu VNC lưu bằng DPAPI (chỉ tài khoản Windows này giải được), không để chữ rõ trong remote_settings.ini.
+static string dpapi(const string& s, bool protect) {
+    DATA_BLOB in{(DWORD)s.size(), (BYTE*)s.data()}, out{};
+    if (s.empty() || !(protect ? CryptProtectData(&in, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)
+                               : CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)))
+        return "";
+    string r((char*)out.pbData, out.cbData);
+    LocalFree(out.pbData);
+    return r;
+}
+static string unhex(const string& h) {
+    string r;
+    for (size_t i = 0; i + 1 < h.size(); i += 2) {
+        if (!isxdigit((unsigned char)h[i]) || !isxdigit((unsigned char)h[i + 1])) return "";  // file cài đặt bị sửa hỏng
+        r += (char)std::stoi(h.substr(i, 2), nullptr, 16);
+    }
+    return r;
+}
+static string g_vnc_addr, g_vnc_pass;  // iPhone (TrollVNC) dùng lần trước
+
 static std::wstring ini_path() { return g_dir + L"\\remote_settings.ini"; }
 static int pick(const int* v, int n, int x, int def) {
     for (int i = 0; i < n; i++) if (v[i] == x) return i;
@@ -2195,6 +2455,11 @@ static void load_settings() {
     g_ddns = ddns_norm(utf8(b));
     GetPrivateProfileStringW(L"net", L"ddns_token", L"", b, 300, ini.c_str());
     g_ddns_token = trim(utf8(b));
+    GetPrivateProfileStringW(L"vnc", L"addr", L"", b, 300, ini.c_str());
+    g_vnc_addr = trim(utf8(b));
+    wchar_t pb[2048];  // mật khẩu đã mã hoá DPAPI, dạng hex
+    GetPrivateProfileStringW(L"vnc", L"pass", L"", pb, 2048, ini.c_str());
+    g_vnc_pass = dpapi(unhex(utf8(pb)), false);
 }
 static void save_settings() {
     auto ini = ini_path();
@@ -2203,6 +2468,9 @@ static void save_settings() {
     WritePrivateProfileStringW(L"stream", L"mbps", std::to_wstring(g_mbps).c_str(), ini.c_str());
     WritePrivateProfileStringW(L"stream", L"hevc", g_hevc ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"net", L"remote", g_remote ? L"1" : L"0", ini.c_str());
+    WritePrivateProfileStringW(L"vnc", L"addr", wide(g_vnc_addr).c_str(), ini.c_str());
+    string vp = dpapi(g_vnc_pass, true);
+    WritePrivateProfileStringW(L"vnc", L"pass", wide(hexs((const uint8_t*)vp.data(), vp.size())).c_str(), ini.c_str());
     std::lock_guard g(g_ddnsmu);
     WritePrivateProfileStringW(L"net", L"ddns", wide(g_ddns).c_str(), ini.c_str());
     WritePrivateProfileStringW(L"net", L"ddns_token", wide(g_ddns_token).c_str(), ini.c_str());
@@ -2246,15 +2514,15 @@ enum Font { F_KICKER, F_LIVE, F_HEAD, F_BODY, F_SMALL, F_BIG, F_TITLE, F_COUNT }
 static HFONT g_font[F_COUNT];
 
 // Bố cục theo 96 DPI. Dải #f5f5f7 từ BAND_Y; hai thẻ trắng bo 28 px.
-constexpr int WIN_W = 520, WIN_H = 976, BAND_Y = 300, TRACK_X = 196, TRACK_W = 280, SEG_H = 30;
-static const RECT CARD_Q = {20, 320, 500, 540}, CARD_NET = {20, 556, 500, 726}, CARD_FILE = {20, 742, 500, 806},
-                  CARD_LOG = {20, 822, 500, 960};
+constexpr int WIN_W = 520, WIN_H = 1016, BAND_Y = 300, TRACK_X = 196, TRACK_W = 280, SEG_H = 30;
+static const RECT CARD_Q = {20, 320, 500, 540}, CARD_NET = {20, 556, 500, 726}, CARD_FILE = {20, 742, 500, 846},
+                  CARD_LOG = {20, 862, 500, 1000};
 static const int ROW_Y[4] = {384, 422, 460, 498}, NET_Y = 618;
 struct Ctl { HWND h; int x, y, w, h_; Font font; Role fg, bg; HWND parent; };  // fg = R_BLUE: nút chính tô xanh
 struct Seg { HWND h; int grp, idx, n, x, w, y; };  // rãnh phân đoạn của nhóm: x, w, y theo 96 DPI
 static std::vector<Ctl> g_ctls;
 static std::vector<Seg> g_segs;
-static HWND h_kicker, h_live, h_status, h_detail, h_acct, h_accbtn, h_kick, h_log, h_net, h_ddns, h_send, h_upd;
+static HWND h_kicker, h_live, h_status, h_detail, h_acct, h_accbtn, h_kick, h_log, h_net, h_ddns, h_send, h_upd, h_vnc;
 static HWND g_dlg, h_dlgerr;  // hộp tạo/đổi tài khoản, tên miền, mã QR
 static void (*g_dlg_save)(HWND);  // nút Lưu / phím Enter của hộp có ô nhập
 static std::vector<HWND> g_dlg_edits;
@@ -2491,6 +2759,12 @@ static void refresh_status() {
     set_text(h_upd, g_updating ? L"Đang cập nhật…" : L"Cập nhật lên " + wide(up.tag));
     string dn = ddns_name();
     set_text(h_ddns, dn.empty() ? L"Chưa đặt" : wide(dn));
+    string rfb;
+    {
+        std::lock_guard g(g_rfbmu);
+        rfb = g_rfb_addr;
+    }
+    set_text(h_vnc, !rfb.empty() ? wide(rfb) : !g_vnc_addr.empty() ? wide(g_vnc_addr) : L"Chưa thấy iPhone");
     set_text(h_accbtn, acc ? L"Đổi tài khoản" : L"Tạo tài khoản");
     for (auto& c : g_ctls)  // chưa có tài khoản: nút tạo tô xanh, là việc cần làm trước
         if (c.h == h_accbtn && (c.fg == R_BLUE) != !acc) c.fg = acc ? R_INK : R_BLUE, InvalidateRect(h_accbtn, nullptr, FALSE);
@@ -2696,6 +2970,388 @@ static void ddns_dialog() {
     run_modal(g_dlg_edits[0]);
 }
 
+// ---- Cửa sổ điều khiển iPhone (TrollVNC) ----
+#define WM_APP_VNCSIZE (WM_APP + 3)  // khung iPhone đổi cỡ (lúc vào, lúc xoay máy): chỉnh cửa sổ theo dáng mới
+struct Vnc {
+    std::mutex m;  // fb, w, h, status, title
+    std::vector<uint32_t> fb;
+    int w = 0, h = 0;
+    std::wstring status = L"Đang kết nối tới iPhone…", title;
+    std::mutex wm;  // ghi socket từ luồng giao diện (chạm, phím) và luồng mạng
+    SOCKET s = INVALID_SOCKET;
+    std::atomic<bool> stop{false};
+    std::atomic<HWND> hwnd{nullptr};
+    int buttons = 0, px = 0, py = 0;  // của luồng giao diện
+    std::vector<uint32_t> keys;       // phím đang giữ: thả hết khi cửa sổ mất focus, tránh kẹt phím trên iPhone
+    bool send(const void* p, size_t n) {
+        std::lock_guard g(wm);
+        return s != INVALID_SOCKET && send_all(s, (const char*)p, n);
+    }
+    void pointer(int mask, int x, int y) {
+        uint8_t b[6] = {5, (uint8_t)mask, (uint8_t)(x >> 8), (uint8_t)x, (uint8_t)(y >> 8), (uint8_t)y};
+        send(b, 6);
+    }
+    void key(uint32_t k, bool down) {
+        uint8_t b[8] = {4, (uint8_t)down, 0, 0, (uint8_t)(k >> 24), (uint8_t)(k >> 16), (uint8_t)(k >> 8), (uint8_t)k};
+        send(b, 8);
+    }
+    void say(const wchar_t* msg) {
+        {
+            std::lock_guard g(m);
+            status = msg, w = h = 0, fb.clear();
+        }
+        if (HWND x = hwnd) InvalidateRect(x, nullptr, FALSE);
+    }
+};
+
+// Một phiên RFB 3.8 tới đầu bên kia đã nối; trả lời lỗi để hiện trong cửa sổ (nullptr = người dùng đóng cửa sổ).
+static const wchar_t* vnc_session(Vnc& v, SOCKET s, const string& pass) {
+    ReadFn rd = [s](void* p, size_t n) {
+        for (size_t got = 0; got < n;) {
+            int r = recv(s, (char*)p + got, (int)std::min<size_t>(n - got, 1 << 20), 0);
+            if (r <= 0) return false;
+            got += r;
+        }
+        return true;
+    };
+    auto skip = [&](size_t n) {
+        char tmp[4096];
+        for (size_t k; n; n -= k)
+            if (!rd(tmp, k = std::min(n, sizeof tmp))) return false;
+        return true;
+    };
+    auto u16 = [](const uint8_t* p) { return p[0] << 8 | p[1]; };
+    auto u32 = [](const uint8_t* p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; };
+    const wchar_t *lost = L"Mất kết nối với iPhone.", *bad = L"iPhone gửi dữ liệu hình không hợp lệ.";
+    char ver[12];
+    if (!rd(ver, 12) || memcmp(ver, "RFB 003.", 8)) return L"Địa chỉ này không phải TrollVNC (VNC).";
+    if (atoi(ver + 8) < 8) return L"Máy chủ VNC quá cũ (cần RFB 3.8).";
+    uint8_t n, b[24];
+    if (!v.send("RFB 003.008\n", 12) || !rd(&n, 1)) return lost;
+    if (!n) return L"iPhone từ chối kết nối.";
+    std::vector<uint8_t> types(n);
+    if (!rd(types.data(), n)) return lost;
+    auto has = [&](uint8_t t) { return std::find(types.begin(), types.end(), t) != types.end(); };
+    uint8_t sec = has(1) ? 1 : has(2) ? 2 : 0;  // 1 = không mật khẩu, 2 = mật khẩu VNC
+    if (!sec) return L"iPhone dùng kiểu đăng nhập VNC chưa hỗ trợ.";
+    if (sec == 2 && pass.empty()) return L"TrollVNC có đặt mật khẩu: bấm \"Điều khiển\" trên cửa sổ Remote Desk và nhập mật khẩu VNC.";
+    if (!v.send(&sec, 1)) return lost;
+    if (sec == 2) {
+        uint8_t ch[16], r[16];
+        if (!rd(ch, 16) || !vnc_auth(pass, ch, r) || !v.send(r, 16)) return lost;
+    }
+    if (!rd(b, 4)) return lost;
+    if (u32(b)) return sec == 2 ? L"Sai mật khẩu VNC." : L"iPhone từ chối kết nối.";
+    uint8_t shared = 1;
+    if (!v.send(&shared, 1) || !rd(b, 24)) return lost;
+    int W = u16(b), H = u16(b + 2);
+    uint32_t nl = u32(b + 20);
+    if (!W || !H || W > 8192 || H > 8192 || nl > 4096) return bad;
+    string name(nl, '\0');
+    if (!rd(name.data(), nl)) return lost;
+    // 32 bit, little-endian, đỏ ở bit 16: trong bộ nhớ là B, G, R, X, đúng thứ tự DIB của Windows
+    const uint8_t pf[20] = {0, 0, 0, 0, 32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0};
+    // Tight, CopyRect, Raw, đổi cỡ khung (xoay máy), JPEG chất lượng 6, nén zlib mức 2 (như mặc định của noVNC)
+    const int32_t enc[] = {7, 1, 0, -223, -26, -254};
+    std::vector<uint8_t> se = {2, 0, 0, (uint8_t)std::size(enc)};
+    for (int32_t e : enc)
+        for (int i = 3; i >= 0; i--) se.push_back((uint8_t)(e >> (8 * i)));
+    if (!v.send(pf, 20) || !v.send(se.data(), se.size())) return lost;
+    auto resize = [&](int w, int h) {
+        {
+            std::lock_guard g(v.m);
+            v.w = w, v.h = h, v.fb.assign((size_t)w * h, 0);
+            v.title = L"iPhone " + wide(name) + L" (TrollVNC)  ·  chuột phải: Home  ·  chuột giữa: nút nguồn  ·  Ctrl = ⌘";
+        }
+        if (HWND x = v.hwnd) PostMessageW(x, WM_APP_VNCSIZE, 0, 0);
+    };
+    resize(W, H);
+    logf("Đang điều khiển iPhone \"%s\" (%dx%d) qua TrollVNC", name.c_str(), W, H);
+    Tight tight;
+    std::vector<uint32_t> px;
+    for (bool full = true; !v.stop;) {  // full: xin cả màn (lúc đầu và sau khi khung đổi cỡ), không thì chỉ phần đổi
+        {
+            std::lock_guard g(v.m);
+            W = v.w, H = v.h;
+        }
+        uint8_t q[10] = {3, (uint8_t)!full, 0, 0, 0, 0, (uint8_t)(W >> 8), (uint8_t)W, (uint8_t)(H >> 8), (uint8_t)H};
+        full = false;
+        if (!v.send(q, 10)) return v.stop ? nullptr : lost;
+        uint8_t t;
+        for (;;) {  // bỏ qua chuông, clipboard, bảng màu tới khi gặp khung hình
+            if (!rd(&t, 1)) return v.stop ? nullptr : lost;
+            if (t == 0) break;
+            if (t == 2) continue;
+            if (t == 1 ? !(rd(b, 5) && skip(u16(b + 3) * 6)) : t == 3 ? !(rd(b, 7) && skip(u32(b + 3))) : true)
+                return v.stop ? nullptr : lost;
+        }
+        if (!rd(b, 3)) return v.stop ? nullptr : lost;
+        for (int i = 0, nr = u16(b + 1); i < nr; i++) {
+            if (!rd(b, 12)) return v.stop ? nullptr : lost;
+            int x = u16(b), y = u16(b + 2), w = u16(b + 4), h = u16(b + 6);
+            int32_t e = (int32_t)u32(b + 8);
+            if (e == -223) {  // TrollVNC xoay khung theo máy: xin lại toàn màn với cỡ mới
+                if (!w || !h || w > 8192 || h > 8192) return bad;
+                resize(w, h);
+                W = w, H = h, full = true;
+                continue;
+            }
+            if (x + w > W || y + h > H) return bad;
+            if (e == 1) {
+                if (!rd(b, 4)) return lost;
+                int sx = u16(b), sy = u16(b + 2);
+                if (sx + w > W || sy + h > H) return bad;
+                std::lock_guard g(v.m);
+                px.resize((size_t)w * h);
+                for (int r = 0; r < h; r++) memcpy(&px[(size_t)r * w], &v.fb[(size_t)(sy + r) * W + sx], w * 4);
+                for (int r = 0; r < h; r++) memcpy(&v.fb[(size_t)(y + r) * W + x], &px[(size_t)r * w], w * 4);
+                continue;
+            }
+            if (e == 0) {
+                px.resize((size_t)w * h);
+                if (!rd(px.data(), px.size() * 4)) return lost;
+            } else if (e == 7) {
+                if (!tight.rect(rd, w, h, px)) return bad;
+            } else {
+                return L"iPhone gửi kiểu mã hoá hình chưa hỗ trợ.";
+            }
+            std::lock_guard g(v.m);
+            for (int r = 0; r < h; r++) memcpy(&v.fb[(size_t)(y + r) * W + x], &px[(size_t)r * w], w * 4);
+        }
+        if (HWND x = v.hwnd) InvalidateRect(x, nullptr, FALSE);
+    }
+    return nullptr;
+}
+static void vnc_thread(std::shared_ptr<Vnc> v, string host, int port, string pass) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);  // WIC giải JPEG
+    const wchar_t* err = L"Không kết nối được iPhone. Kiểm tra TrollVNC đã bật và iPhone cùng mạng Wi‑Fi với PC.";
+    if (SOCKET s = tcp_connect(host, port, 5000); s != INVALID_SOCKET) {
+        {
+            std::lock_guard g(v->wm);
+            v->s = s;
+        }
+        if (v->stop) shutdown(s, SD_BOTH);  // cửa sổ đã đóng trong lúc đang nối
+        err = vnc_session(*v, s, pass);
+        {
+            std::lock_guard g(v->wm);
+            v->s = INVALID_SOCKET;
+        }
+        closesocket(s);
+    }
+    if (err && !v->stop) {
+        v->say(err);
+        logf("iPhone (TrollVNC): %s", utf8(err).c_str());
+    }
+    CoUninitialize();
+}
+
+static RECT vnc_fit(const RECT& cr, int w, int h) {  // giữ đúng tỉ lệ hình iPhone, viền đen hai bên
+    int dw = cr.right, dh = (int)((int64_t)cr.right * h / w);
+    if (dh > cr.bottom) dh = cr.bottom, dw = (int)((int64_t)cr.bottom * w / h);
+    int x = (cr.right - dw) / 2, y = (cr.bottom - dh) / 2;
+    return {x, y, x + dw, y + dh};
+}
+static std::shared_ptr<Vnc> g_vnc;  // một lúc một iPhone
+static LRESULT CALLBACK vnc_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* v = (Vnc*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    if (!v) return DefWindowProcW(h, msg, wp, lp);
+    auto at = [&](int cx, int cy) {  // toạ độ trong cửa sổ -> điểm ảnh trên iPhone
+        RECT cr;
+        GetClientRect(h, &cr);
+        std::lock_guard g(v->m);
+        if (!v->w) return false;
+        RECT d = vnc_fit(cr, v->w, v->h);
+        v->px = std::clamp((int)((int64_t)(cx - d.left) * v->w / std::max<LONG>(1, d.right - d.left)), 0, v->w - 1);
+        v->py = std::clamp((int)((int64_t)(cy - d.top) * v->h / std::max<LONG>(1, d.bottom - d.top)), 0, v->h - 1);
+        return true;
+    };
+    auto press = [&](int bit, bool down) {
+        if (!at((short)LOWORD(lp), (short)HIWORD(lp))) return 0;
+        v->buttons = down ? v->buttons | bit : v->buttons & ~bit;
+        v->pointer(v->buttons, v->px, v->py);
+        if (down) SetCapture(h);
+        else if (!v->buttons) ReleaseCapture();
+        return 0;
+    };
+    switch (msg) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT:
+        buffered_paint(h, [v](HDC m, RECT cr) {
+            FillRect(m, &cr, (HBRUSH)GetStockObject(BLACK_BRUSH));
+            std::lock_guard g(v->m);
+            if (v->w) {
+                RECT d = vnc_fit(cr, v->w, v->h);
+                BITMAPINFO bi{};
+                bi.bmiHeader = {sizeof(BITMAPINFOHEADER), v->w, -v->h, 1, 32, BI_RGB};
+                SetStretchBltMode(m, HALFTONE);
+                SetBrushOrgEx(m, 0, 0, nullptr);
+                StretchDIBits(m, d.left, d.top, d.right - d.left, d.bottom - d.top, 0, 0, v->w, v->h, v->fb.data(), &bi,
+                              DIB_RGB_COLORS, SRCCOPY);
+                return;
+            }
+            RECT r = cr, c{};
+            InflateRect(&r, -S(28), 0);
+            HGDIOBJ of = SelectObject(m, g_font[F_BODY]);
+            SetTextColor(m, RGB(235, 235, 240));
+            SetBkMode(m, TRANSPARENT);
+            c = r;
+            DrawTextW(m, v->status.c_str(), -1, &c, DT_CENTER | DT_WORDBREAK | DT_CALCRECT);
+            OffsetRect(&r, 0, (cr.bottom - (c.bottom - c.top)) / 2);
+            DrawTextW(m, v->status.c_str(), -1, &r, DT_CENTER | DT_WORDBREAK);
+            SelectObject(m, of);
+        });
+        return 0;
+    case WM_SIZE: InvalidateRect(h, nullptr, FALSE); return 0;
+    case WM_APP_VNCSIZE: {
+        int w, hh;
+        std::wstring title;
+        {
+            std::lock_guard g(v->m);
+            w = v->w, hh = v->h, title = v->title;
+        }
+        if (!w) return 0;
+        SetWindowTextW(h, title.c_str());
+        MONITORINFO mi{sizeof mi};
+        GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi);
+        RECT wa = mi.rcWork, cur;
+        double sc = std::min({(wa.right - wa.left) * 0.9 / w, (wa.bottom - wa.top) * 0.9 / hh, 1.0});
+        RECT rc{0, 0, (LONG)(w * sc), (LONG)(hh * sc)};
+        AdjustWindowRectExForDpi(&rc, WS_OVERLAPPEDWINDOW, FALSE, 0, GetDpiForWindow(h));
+        int ww = rc.right - rc.left, wh = rc.bottom - rc.top;
+        GetWindowRect(h, &cur);  // giữ tâm cửa sổ, không tràn khỏi màn hình
+        int x = std::max<int>(wa.left, std::min<int>((cur.left + cur.right - ww) / 2, wa.right - ww));
+        int y = std::max<int>(wa.top, std::min<int>((cur.top + cur.bottom - wh) / 2, wa.bottom - wh));
+        SetWindowPos(h, nullptr, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: return press(1, true);  // chạm
+    case WM_LBUTTONUP: return press(1, false);
+    case WM_MBUTTONDOWN: return press(2, true);  // nút nguồn (giữ lâu như bấm giữ thật)
+    case WM_MBUTTONUP: return press(2, false);
+    case WM_RBUTTONDOWN: return press(4, true);  // nút Home
+    case WM_RBUTTONUP: return press(4, false);
+    case WM_MOUSEMOVE:
+        if (v->buttons && at((short)LOWORD(lp), (short)HIWORD(lp))) v->pointer(v->buttons, v->px, v->py);
+        return 0;
+    case WM_MOUSEWHEEL: {  // TrollVNC đổi một nấc bánh xe thành một lần vuốt ngắn
+        POINT p{(short)LOWORD(lp), (short)HIWORD(lp)};
+        ScreenToClient(h, &p);
+        if (!at(p.x, p.y)) return 0;
+        int bit = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 8 : 16;
+        v->pointer(v->buttons | bit, v->px, v->py);
+        v->pointer(v->buttons, v->px, v->py);
+        return 0;
+    }
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+    case WM_KEYUP:
+    case WM_SYSKEYUP: {
+        bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+        if (wp == VK_F4 && GetKeyState(VK_MENU) < 0) break;  // Alt+F4 vẫn đóng cửa sổ
+        if (down && (lp & (1 << 30))) return 0;              // bỏ lặp phím của Windows: iPhone tự lặp khi giữ
+        if (uint32_t k = vnc_keysym((UINT)wp)) {
+            v->key(k, down);
+            if (down) v->keys.push_back(k);
+            else std::erase(v->keys, k);
+        }
+        return 0;
+    }
+    case WM_SYSCHAR: return 0;  // không kêu "bíp" khi giữ Alt (Option)
+    case WM_KILLFOCUS:
+        for (uint32_t k : v->keys) v->key(k, false);
+        v->keys.clear();
+        if (v->buttons) v->buttons = 0, v->pointer(0, v->px, v->py);
+        return 0;
+    case WM_DESTROY: {
+        v->stop = true;
+        {
+            std::lock_guard g(v->wm);
+            if (v->s != INVALID_SOCKET) shutdown(v->s, SD_BOTH);  // luồng mạng đang chờ đọc: cho nó thoát
+        }
+        v->hwnd = nullptr;
+        SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+        if (g_vnc.get() == v) g_vnc.reset();
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+static void vnc_open(const string& addr, const string& pass) {
+    if (g_vnc)
+        if (HWND old = g_vnc->hwnd) DestroyWindow(old);
+    HINSTANCE hi = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{sizeof wc};
+    if (!GetClassInfoExW(hi, L"RemoteDeskVnc", &wc)) {
+        wc = {sizeof wc};
+        wc.lpfnWndProc = vnc_proc, wc.hInstance = hi, wc.lpszClassName = L"RemoteDeskVnc";
+        wc.hIcon = LoadIconW(hi, MAKEINTRESOURCEW(1)), wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
+        RegisterClassExW(&wc);
+    }
+    // Mở trên màn đang có cửa sổ chính (khi chơi game người dùng để cửa sổ chính ở màn phụ), cỡ tạm theo dáng iPhone
+    MONITORINFO mi{sizeof mi};
+    GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    RECT wa = mi.rcWork;
+    int h = (wa.bottom - wa.top) * 8 / 10, w = h * 9 / 19;
+    HWND hw = CreateWindowExW(0, L"RemoteDeskVnc", L"iPhone (TrollVNC)", WS_OVERLAPPEDWINDOW, wa.left + (wa.right - wa.left - w) / 2,
+                              wa.top + (wa.bottom - wa.top - h) / 2, w, h, nullptr, nullptr, hi, nullptr);
+    if (!hw) return;
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(hw, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof dark);
+    auto v = std::make_shared<Vnc>();
+    v->hwnd = hw;
+    SetWindowLongPtrW(hw, GWLP_USERDATA, (LONG_PTR)v.get());
+    g_vnc = v;
+    size_t c = addr.rfind(':');
+    ShowWindow(hw, SW_SHOW);
+    std::thread(vnc_thread, v, addr.substr(0, c), c == string::npos ? 5901 : atoi(addr.c_str() + c + 1), pass).detach();
+}
+
+// ---- Hộp địa chỉ iPhone (TrollVNC) ----
+static bool g_vnc_go;
+static void vnc_save(HWND dlg) {
+    string a = trim(edit_text(g_dlg_edits[0])), p = edit_text(g_dlg_edits[1]);
+    size_t c = a.rfind(':');
+    int port = c == string::npos ? 5901 : atoi(a.c_str() + c + 1);
+    if (a.empty() || c == 0 || port <= 0 || port > 65535)
+        return (void)SetWindowTextW(h_dlgerr, L"Nhập địa chỉ iPhone, ví dụ 192.168.0.101 hoặc 192.168.0.101:5901.");
+    g_vnc_addr = a, g_vnc_pass = p;
+    save_settings();
+    g_vnc_go = true;
+    DestroyWindow(dlg);
+}
+static void vnc_dialog() {
+    if (g_dlg) return;
+    g_vnc_go = false;
+    string found, name;
+    {
+        std::lock_guard g(g_rfbmu);
+        found = g_rfb_addr, name = g_rfb_name;
+    }
+    open_dialog(L"RemoteDeskAccount", dlg_proc, L"Điều khiển iPhone", DLG_W, DDNS_H);
+    g_dlg_save = vnc_save;
+    label(L"Điều khiển iPhone", 28, 22, 304, 44, F_HEAD, R_INK, R_CANVAS, SS_LEFT, g_dlg);
+    std::wstring hint = found.empty() ? L"iPhone đã jailbreak và bật TrollVNC, cùng mạng Wi‑Fi với PC. Chưa thấy iPhone nào qua Bonjour: "
+                                        L"xem IP ở Cài đặt > TrollVNC trên iPhone rồi nhập vào đây."
+                                      : L"Đã tìm thấy " + wide(name) + L" trong mạng nhà. Chuột trái là chạm, chuột phải là nút Home, "
+                                        L"chuột giữa là nút nguồn.";
+    label(hint.c_str(), 28, 70, 304, 72, F_SMALL, R_SLATE, R_CANVAS, SS_LEFT, g_dlg);
+    const wchar_t* names[] = {L"Địa chỉ iPhone (cổng mặc định 5901)", L"Mật khẩu VNC (bỏ trống nếu TrollVNC không đặt)"};
+    for (int i = 0; i < 2; i++) {
+        int y = 150 + i * 70;
+        label(names[i], 28, y, 304, 18, F_SMALL, R_SLATE, R_CANVAS, SS_LEFT, g_dlg);
+        g_dlg_edits.push_back(ctl(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL | (i ? ES_PASSWORD : 0), 44, y + 30, 272, 22,
+                                  ID_ACC_EDIT + i, F_BODY, R_INK, R_CANVAS, g_dlg));
+        SendMessageW(g_dlg_edits.back(), EM_LIMITTEXT, i ? 8 : 253, 0);  // VNC chỉ dùng 8 ký tự đầu của mật khẩu
+    }
+    SetWindowTextW(g_dlg_edits[0], wide(found.empty() ? g_vnc_addr : found).c_str());  // IP iPhone hay đổi: ưu tiên chỗ vừa thấy
+    SetWindowTextW(g_dlg_edits[1], wide(g_vnc_pass).c_str());
+    h_dlgerr = label(L"", 28, 290, 304, 20, F_SMALL, R_ORANGE, R_CANVAS, SS_LEFT, g_dlg);
+    ctl(L"BUTTON", L"Huỷ", WS_TABSTOP | BS_OWNERDRAW, 152, 326, 84, 34, ID_ACC_CANCEL, F_SMALL, R_INK, R_CANVAS, g_dlg);
+    ctl(L"BUTTON", L"Kết nối", WS_TABSTOP | BS_OWNERDRAW, 246, 326, 86, 34, ID_ACC_SAVE, F_SMALL, R_BLUE, R_CANVAS, g_dlg);
+    run_modal(g_dlg_edits[0]);
+    if (g_vnc_go) vnc_open(g_vnc_addr, g_vnc_pass);  // mở sau khi hộp đóng hẳn, để cửa sổ iPhone nằm trên cùng
+}
+
 // ---- Hộp mã QR ghép iPhone ----
 constexpr int PAIR_H = 500, QR_X = 60, QR_Y = 128, QR_BOX = 240;
 static Qr g_qr;
@@ -2794,6 +3450,8 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (!f.empty()) std::thread(offer_files, f).detach();
         } else if (LOWORD(wp) == ID_RECVDIR) {
             ShellExecuteW(h, L"open", recv_dir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        } else if (LOWORD(wp) == ID_VNC) {
+            vnc_dialog();
         } else if (LOWORD(wp) == ID_UPDATE) {  // bản zip/tự build: mở trang tải; bản đã cài: cập nhật ngay
             if (installed_copy()) std::thread(update_now, latest_update()).detach();
             else ShellExecuteW(h, L"open", RELEASES, nullptr, nullptr, SW_SHOWNORMAL);
@@ -2899,8 +3557,13 @@ static void run_ui() {
     EnableWindow(h_send, FALSE);
     ctl(L"BUTTON", L"Thư mục nhận", WS_TABSTOP | BS_OWNERDRAW, 352, 758, 124, 30, ID_RECVDIR, F_SMALL, R_INK, R_CARD);
 
-    label(L"Nhật ký", 48, 842, 400, 26, F_TITLE, R_INK, R_CARD);
-    h_log = ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 48, 874, 424, 74, 0, F_SMALL, R_SLATE, R_CARD);
+    // iPhone đã jailbreak có TrollVNC: xem và điều khiển iPhone ngay trên PC (tự tìm qua Bonjour)
+    label(L"iPhone (TrollVNC)", 48, 804, 140, 20, F_SMALL, R_SLATE, R_CARD);
+    h_vnc = label(L"", 196, 804, 148, 20, F_SMALL, R_INK, R_CARD, SS_LEFT | SS_ENDELLIPSIS);
+    ctl(L"BUTTON", L"Điều khiển", WS_TABSTOP | BS_OWNERDRAW, 352, 798, 124, 30, ID_VNC, F_SMALL, R_INK, R_CARD);
+
+    label(L"Nhật ký", 48, 882, 400, 26, F_TITLE, R_INK, R_CARD);
+    h_log = ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 48, 914, 424, 74, 0, F_SMALL, R_SLATE, R_CARD);
 
     layout();
     apply_theme();
@@ -3114,6 +3777,83 @@ static int self_test() {
             printf("encoder HEVC: không có (sẽ dùng H.264)\n");
         }
     }
+    // TrollVNC: độ dài compact, xác thực VNC (vector tính bằng thư viện cryptography của Python), phím, và giải mã
+    // Tight: một màu, zlib dùng tiếp qua nhiều ô và sau khi reset luồng, bảng màu 1 bit, gradient, JPEG
+    {
+        auto reader = [](const std::vector<uint8_t>& d, size_t& pos) -> ReadFn {
+            return [&d, &pos](void* p, size_t n) {
+                if (pos + n > d.size()) return false;
+                memcpy(p, d.data() + pos, n), pos += n;
+                return true;
+            };
+        };
+        size_t pos = 0;
+        uint32_t n = 0;
+        std::vector<uint8_t> msg = {0x90, 0x4E, 0x05};
+        CHECK(tight_len(reader(msg, pos), n) && n == 10000 && pos == 2);
+        msg = {0xFF, 0xFF, 0x01}, pos = 0;
+        CHECK(tight_len(reader(msg, pos), n) && n == 0x7FFF && pos == 3);
+        uint8_t ch[16], out[16];
+        for (int i = 0; i < 16; i++) ch[i] = (uint8_t)i;
+        CHECK(vnc_auth("trollvnc", ch, out) && hexs(out, 16) == "f274f5a243dfda6253d8eb67f74a554c");
+        CHECK(vnc_keysym('A') == 'a' && vnc_keysym(VK_OEM_1) == ';' && vnc_keysym(VK_RETURN) == 0xFF0D && vnc_keysym(VK_CONTROL) == 0xFFEB &&
+              vnc_keysym(VK_F5) == 0xFFC2 && vnc_keysym(VK_LWIN) == 0);
+        CHECK(unhex("00ff7a") == string("\0\xff\x7a", 3) && unhex("zz").empty() && dpapi(dpapi("bí mật", true), false) == "bí mật");
+        auto clen = [](std::vector<uint8_t>& m, size_t k) {
+            m.push_back((uint8_t)((k & 0x7F) | (k > 0x7F ? 0x80 : 0)));
+            if (k > 0x7F) m.push_back((uint8_t)((k >> 7 & 0x7F) | (k > 0x3FFF ? 0x80 : 0)));
+            if (k > 0x3FFF) m.push_back((uint8_t)(k >> 14));
+        };
+        z_stream zs[2]{};
+        deflateInit(&zs[0], 6), deflateInit(&zs[1], 6);
+        auto zsync = [&zs](int id, const std::vector<uint8_t>& raw) {  // như máy chủ: nén tiếp luồng cũ, đẩy ra bằng Z_SYNC_FLUSH
+            std::vector<uint8_t> o(raw.size() + 64);
+            zs[id].next_in = (Bytef*)raw.data(), zs[id].avail_in = (uInt)raw.size();
+            zs[id].next_out = o.data(), zs[id].avail_out = (uInt)o.size();
+            deflate(&zs[id], Z_SYNC_FLUSH);
+            o.resize(o.size() - zs[id].avail_out);
+            return o;
+        };
+        auto same = [](const std::vector<uint8_t>& rgb, const std::vector<uint32_t>& px) {
+            bool ok = px.size() * 3 == rgb.size();
+            for (size_t i = 0; ok && i < px.size(); i++)
+                ok = px[i] == (0xFF000000u | rgb[i * 3] << 16 | rgb[i * 3 + 1] << 8 | rgb[i * 3 + 2]);
+            return ok;
+        };
+        Tight t;
+        std::vector<uint32_t> px;
+        msg = {0x80, 10, 20, 30}, pos = 0;  // cả ô một màu
+        CHECK(t.rect(reader(msg, pos), 3, 2, px) && px.size() == 6 && px[5] == 0xFF0A141E);
+        std::vector<uint8_t> rgb(4 * 3 * 3);
+        for (size_t i = 0; i < rgb.size(); i++) rgb[i] = (uint8_t)(i * 7);
+        for (int k = 0; k < 3; k++) {  // ô 2 nối tiếp luồng của ô 1; trước ô 3 máy chủ reset luồng 0 rồi nén lại từ đầu
+            if (k == 2) deflateEnd(&zs[0]), zs[0] = {}, deflateInit(&zs[0], 6);
+            auto z = zsync(0, rgb);
+            msg = {(uint8_t)(k == 2 ? 0x01 : 0x00)}, clen(msg, z.size()), msg.insert(msg.end(), z.begin(), z.end()), pos = 0;
+            CHECK(t.rect(reader(msg, pos), 4, 3, px) && pos == msg.size() && same(rgb, px));
+            for (auto& c : rgb) c += 3;
+        }
+        msg = {0x40, 1, 1, 1, 2, 3, 200, 201, 202, 0b10100000, 0b01000000, 0, 0b10000000}, pos = 0;  // bảng 2 màu, 1 bit/điểm
+        CHECK(t.rect(reader(msg, pos), 10, 2, px) && px[0] == 0xFFC8C9CA && px[1] == 0xFF010203 && px[2] == 0xFFC8C9CA &&
+              px[8] == 0xFF010203 && px[9] == 0xFFC8C9CA && px[10] == 0xFF010203 && px[18] == 0xFFC8C9CA && px[19] == 0xFF010203);
+        std::vector<uint8_t> res(3 * 2 * 3, 0);
+        res[0] = 10, res[1] = 20, res[2] = 30;  // gradient: chỉ điểm đầu có phần dư nên cả ô thành một màu
+        auto z = zsync(1, res);
+        msg = {0x50, 2}, clen(msg, z.size()), msg.insert(msg.end(), z.begin(), z.end()), pos = 0;
+        CHECK(t.rect(reader(msg, pos), 3, 2, px) && std::all_of(px.begin(), px.end(), [](uint32_t c) { return c == 0xFF0A141E; }));
+        string j = unhex(  // JPEG 16×8 màu (200, 100, 50) tạo bằng Pillow
+            "ffd8ffe000104a46494600010100000100010000ffdb0043000302020302020303030304030304050805050404050a070706080c0a0c0c0b0a0b0b0d0e12"
+            "100d0e110e0b0b1016101113141515150c0f171816141812141514ffdb00430103040405040509050509140d0b0d14141414141414141414141414141414"
+            "14141414141414141414141414141414141414141414141414141414141414141414ffc00011080008001003012200021101031101ffc4001500010100000000"
+            "000000000000000000000004ffc40014100100000000000000000000000000000000ffc4001501010100000000000000000000000000000708ffc4001411010000"
+            "0000000000000000000000000000ffda000c03010002110311003f0090007a907fffd9");
+        msg = {0x90}, clen(msg, j.size()), msg.insert(msg.end(), j.begin(), j.end()), pos = 0;
+        auto close_to = [](uint32_t c) { return abs((int)(c >> 16 & 255) - 200) < 6 && abs((int)(c >> 8 & 255) - 100) < 6 && abs((int)(c & 255) - 50) < 6; };
+        CHECK(t.rect(reader(msg, pos), 16, 8, px) && close_to(px[0]) && close_to(px[127]));
+        msg = {0xA0}, pos = 0;
+        CHECK(!t.rect(reader(msg, pos), 4, 4, px));  // PNG của TightPNG (không xin) bị từ chối
+        deflateEnd(&zs[0]), deflateEnd(&zs[1]);
+    }
     // Chụp màn hình (chỉ đọc)
     Capture cap;
     CHECK(cap.init());
@@ -3191,6 +3931,7 @@ int main(int argc, char** argv) {
     for (auto& ip : reachable_ips())
         logf("%s: https://%s:%d", is_tailscale(ip) ? "Tailscale (ở ngoài)" : "Safari trong mạng nhà", ip.c_str(), g_port);
     mdns_register();
+    rfb_browse();
     std::thread(remote_loop).detach();
     std::thread(update_loop).detach();
     std::thread([l] { for (SOCKET s; (s = accept(l, nullptr, nullptr)) != INVALID_SOCKET;) std::thread(client_thread, s).detach(); }).detach();

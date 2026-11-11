@@ -37,7 +37,7 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
-          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-nsis
+          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-nsis mingw-w64-ucrt-x86_64-zlib
       # Máy CI không có GPU và màn hình nên không chạy --self-test (cần NVENC và DXGI); self-test chạy trên PC thật.
       - name: Build remote_host.exe
         run: VERSION=${GITHUB_REF_NAME#v} bash build_host.sh

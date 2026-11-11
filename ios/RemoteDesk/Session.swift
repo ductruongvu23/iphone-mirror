@@ -92,10 +92,12 @@ final class HostStore: ObservableObject {
 final class Discovery: ObservableObject {
     @Published var found: [NWBrowser.Result] = []
     private var browser: NWBrowser?
+    private let type: String
+    init(type: String = "_remotedesk._tcp") { self.type = type }  // "_rfb._tcp": iPhone bật TrollVNC
 
     func start() {
         guard browser == nil else { return }
-        let b = NWBrowser(for: .bonjour(type: "_remotedesk._tcp", domain: nil), using: .tcp)
+        let b = NWBrowser(for: .bonjour(type: type, domain: nil), using: .tcp)
         b.browseResultsChangedHandler = { [weak self] results, _ in self?.found = Array(results) }
         b.start(queue: .main)
         browser = b

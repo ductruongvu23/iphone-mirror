@@ -6,6 +6,7 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_remotedesk._tcp</string>
+		<string>_rfb._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Để tìm và điều khiển PC chạy Remote Desk trong mạng nhà bạn.</string>

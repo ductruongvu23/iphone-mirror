@@ -5,6 +5,13 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var store = HostStore()
     @StateObject private var discovery = Discovery()
+    @StateObject private var rfb = Discovery(type: "_rfb._tcp")
+    @StateObject private var vncStore = VNCStore()
+    @State private var vnc: VNCClient?
+    @State private var addingVNC = false
+    @State private var vncAddress = ""
+    @State private var vncPass = ""
+    @State private var pendingVNC: VNCTarget?  // mở sau khi sheet đóng hẳn
     @State private var active: Session?
     @State private var loginTarget: SavedHost?
     @State private var form: LoginForm?
@@ -45,10 +52,11 @@ struct ContentView: View {
                         form = nil
                     }
                 }
+                iphones
             }
         }
         .background(Theme.band.ignoresSafeArea())
-        .alert("Không tìm được địa chỉ PC", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
+        .alert("Không kết nối được", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("OK", role: .cancel) {}
         } message: { Text(error ?? "") }
         .fullScreenCover(item: $active) { s in
@@ -73,7 +81,10 @@ struct ContentView: View {
             .navigationViewStyle(.stack)
         }
         .onOpenURL(perform: pair)  // quét bằng app Camera: iOS mở remotedesk://pair?... vào thẳng app
-        .onAppear { discovery.start() }
+        .onAppear {
+            discovery.start()
+            rfb.start()
+        }
         .task {
             if let v = await AppUpdate.latest(), AppUpdate.newer(v, than: AppUpdate.current) { newVersion = v }
         }
@@ -148,6 +159,91 @@ struct ContentView: View {
         .frame(maxWidth: 720)
         .frame(maxWidth: .infinity)
         .background(Theme.band)
+    }
+
+    /// iPhone/iPad khác đã jailbreak có TrollVNC: tự tìm qua Bonjour, hoặc thêm bằng địa chỉ.
+    private var iphones: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("iPhone (TrollVNC)").font(.display(28)).foregroundStyle(Theme.ink)
+                Spacer()
+                Button("Thêm bằng địa chỉ ›") { addingVNC = true }
+                    .font(.text(17)).foregroundStyle(Theme.link)
+            }
+            ForEach(rfb.found, id: \.self) { r in
+                let name = Discovery.name(r)
+                HostCard(title: name, subtitle: "Trong mạng này", busy: resolving == name, icon: "iphone") { pickVNC(r) }
+            }
+            ForEach(vncStore.targets) { t in
+                HostCard(title: t.name, subtitle: t.address, busy: false, icon: "iphone") { openVNC(t) }
+                    .contextMenu {
+                        Button("Quên iPhone này", role: .destructive) {
+                            vncStore.targets.removeAll { $0.address == t.address }
+                            Keychain.delete("vnc:" + t.address)
+                        }
+                    }
+            }
+            Text("Điều khiển iPhone/iPad khác đã jailbreak và bật TrollVNC, cùng mạng Wi‑Fi. Chạm như dùng thật; nút Home, bàn phím và nút nguồn ở nút nhỏ giữa mép trên.")
+                .font(.text(12)).tracking(-0.12)
+                .foregroundStyle(Theme.slate)
+        }
+        .padding(.horizontal, 20)
+        .padding(.bottom, 40)
+        .frame(maxWidth: 720)
+        .frame(maxWidth: .infinity)
+        .background(Theme.band)
+        .fullScreenCover(item: $vnc) { c in VNCView(client: c) { vnc = nil } }
+        .sheet(isPresented: $addingVNC, onDismiss: {
+            if let t = pendingVNC { pendingVNC = nil; openVNC(t, password: vncPass) }
+            vncPass = ""
+        }) {
+            NavigationView {
+                Form {
+                    Section {
+                        TextField("IP iPhone, ví dụ 192.168.0.101", text: $vncAddress).keyboardType(.numbersAndPunctuation)
+                            .textInputAutocapitalization(.never).autocorrectionDisabled()
+                        SecureField("Mật khẩu VNC (bỏ trống nếu không đặt)", text: $vncPass)
+                    } footer: { Text("Xem IP ở Cài đặt > TrollVNC trên iPhone kia. Cổng mặc định 5901.") }
+                    .listRowBackground(Theme.card)
+                }
+                .formBackground(Theme.band)
+                .navigationTitle("Thêm iPhone (TrollVNC)")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { addingVNC = false } }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Kết nối") {
+                            let a = VNCTarget.normalize(vncAddress)
+                            pendingVNC = VNCTarget(name: a, address: a)
+                            addingVNC = false
+                        }
+                        .disabled(vncAddress.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                }
+            }
+            .navigationViewStyle(.stack)
+            .sheetStyle()
+        }
+    }
+
+    private func pickVNC(_ r: NWBrowser.Result) {
+        let name = Discovery.name(r)
+        resolving = name
+        Discovery.resolve(r.endpoint) { addr in
+            resolving = nil
+            guard let addr else { error = "Không tìm được địa chỉ iPhone này. Thêm bằng IP trong Cài đặt > TrollVNC."; return }
+            openVNC(VNCTarget(name: name, address: addr))
+        }
+    }
+
+    private func openVNC(_ t: VNCTarget, password: String? = nil) {
+        guard !VNCTarget.isSelf(t.address) else {
+            error = "Đây là chính iPhone này. TrollVNC chỉ điều khiển được từ máy khác (PC hoặc iPhone/iPad khác)."
+            return
+        }
+        let c = VNCClient(target: t, password: password.flatMap { $0.isEmpty ? nil : $0 } ?? Keychain.get("vnc:" + t.address))
+        c.onConnected = { vncStore.upsert($0) }  // chỉ lưu khi đã vào được
+        vnc = c
     }
 
     private func pick(_ r: NWBrowser.Result) {
@@ -261,11 +357,12 @@ struct HostCard: View {
     let title: String
     let subtitle: String
     let busy: Bool
+    var icon = "desktopcomputer"
     let action: () -> Void
 
     var body: some View {
         HStack(spacing: 16) {
-            Image(systemName: "desktopcomputer")
+            Image(systemName: icon)
                 .font(.system(size: 28, weight: .light))
                 .foregroundStyle(Theme.ink)
                 .accessibilityHidden(true)
