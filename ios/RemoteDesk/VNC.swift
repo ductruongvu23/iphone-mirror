@@ -577,7 +577,7 @@ struct VNCView: View {
             } label: {
                 Image(systemName: "slider.horizontal.3").font(.system(size: 14, weight: .semibold)).frame(width: 46, height: 28)
             }
-            .foregroundStyle(Theme.overlayInk)
+            .foregroundStyle(.primary)
             .overlayTrack(14)
             .accessibilityLabel("Nút Home, bàn phím, ngắt")
             status.frame(maxHeight: .infinity)
@@ -604,7 +604,7 @@ struct VNCView: View {
             .foregroundStyle(Theme.ink)
             .padding(.horizontal, 28)
             .padding(.vertical, 20)
-            .card()
+            .glassCard()
         case .failed(let msg, let ask):
             VStack(spacing: 16) {
                 Text(msg).font(.text(17)).foregroundStyle(Theme.ink).multilineTextAlignment(.center)
@@ -618,13 +618,13 @@ struct VNCView: View {
                         if ask { client.password = pass }
                         client.connect()
                     }
-                    .buttonStyle(BluePill())
-                    Button("Đóng", action: close).buttonStyle(OutlinePill())
+                    .primaryStyle()
+                    Button("Đóng", action: close).secondaryStyle()
                 }
             }
             .padding(28)
             .frame(maxWidth: 380)
-            .card()
+            .glassCard()
         case .live:
             EmptyView()
         }

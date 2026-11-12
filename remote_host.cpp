@@ -27,6 +27,7 @@
 #include <windns.h>
 #include <commctrl.h>
 #include <dwmapi.h>
+#include <uxtheme.h>
 #include <gdiplus.h>
 #include <winhttp.h>
 #include <commdlg.h>
@@ -2183,10 +2184,11 @@ static bool setup_tls(const std::wstring& cn, bool& created) {
                                      &g_cred, nullptr) == SEC_E_OK;
 }
 
-// ======================= Giao diện Windows: kiểu "white gallery" của Apple, có bản tối =======================
-// Nền trắng/#f5f5f7, chữ Ink, thẻ bo 28 px không bóng, nút pill viền mảnh, phân đoạn kiểu Apple.
+// ======================= Giao diện Windows: kiểu Cài đặt của Windows 11/macOS, có bản tối =======================
+// Thanh bên chọn trang; thẻ trắng viền mảnh chia hàng; nút viên thuốc (xanh cho việc chính); phân đoạn kiểu Apple.
 // Theo chế độ sáng/tối của Windows (App mode) và tự đổi khi người dùng đổi.
-enum { ID_ACCOUNT = 101, ID_KICK, ID_FORGET, ID_ACC_SAVE, ID_ACC_CANCEL, ID_PAIR, ID_DDNS, ID_SEND, ID_RECVDIR, ID_UPDATE, ID_VNC, ID_ACC_EDIT = 120, ID_SEG = 200 };  // phân đoạn: ID_SEG + nhóm*10 + vị trí
+enum { ID_ACCOUNT = 101, ID_KICK, ID_FORGET, ID_ACC_SAVE, ID_ACC_CANCEL, ID_PAIR, ID_DDNS, ID_SEND, ID_RECVDIR, ID_UPDATE, ID_VNC,
+       ID_ACC_EDIT = 120, ID_SEG = 200, ID_NAV = 300 };  // phân đoạn: ID_SEG + nhóm*10 + vị trí; trang: ID_NAV + trang
 static DNS_SERVICE_REGISTER_REQUEST g_reg{};
 
 static std::wstring wide(const string& s) {
@@ -2500,43 +2502,59 @@ static void mdns_register() {
         logf("Không quảng bá được trên mạng LAN; trên iPhone hãy nhập IP bằng tay");
 }
 
-// ---- Bảng màu (token của bản hướng dẫn; bản tối theo trang tối của Apple) ----
-enum Role { R_CANVAS, R_BAND, R_CARD, R_HAIR, R_TRACK, R_SEGON, R_INK, R_SLATE, R_STEEL, R_BLUE, R_ORANGE, R_COUNT };
-static const COLORREF LIGHT[R_COUNT] = {RGB(255, 255, 255), RGB(245, 245, 247), RGB(255, 255, 255), RGB(214, 214, 214),
-                                        RGB(230, 230, 232), RGB(255, 255, 255), RGB(29, 29, 31), RGB(112, 112, 112),
-                                        RGB(134, 134, 139), RGB(0, 113, 227), RGB(182, 68, 0)};
-static const COLORREF DARK[R_COUNT] = {RGB(0, 0, 0), RGB(22, 22, 23), RGB(29, 29, 31), RGB(66, 66, 69),
-                                       RGB(51, 51, 54), RGB(99, 99, 102), RGB(245, 245, 247), RGB(161, 161, 166),
-                                       RGB(134, 134, 139), RGB(0, 113, 227), RGB(245, 99, 0)};
+// ---- Bảng màu: nền xám nhạt như Cài đặt của Windows 11/macOS, thẻ trắng viền mảnh; bản tối theo macOS ----
+// R_BAND: nút phụ đang bấm/có chuột; R_TRACK: nền nút phụ và rãnh phân đoạn; R_SEL: mục đang chọn ở thanh bên
+enum Role { R_CANVAS, R_BAND, R_CARD, R_HAIR, R_TRACK, R_SEGON, R_INK, R_SLATE, R_STEEL, R_BLUE, R_ORANGE, R_SEL, R_GREEN, R_COUNT };
+static const COLORREF LIGHT[R_COUNT] = {RGB(243, 243, 246), RGB(222, 222, 228), RGB(255, 255, 255), RGB(224, 224, 230),
+                                        RGB(236, 236, 241), RGB(255, 255, 255), RGB(29, 29, 31),    RGB(108, 108, 113),
+                                        RGB(142, 142, 147), RGB(0, 113, 227),   RGB(182, 68, 0),    RGB(226, 226, 232),
+                                        RGB(40, 167, 69)};
+static const COLORREF DARK[R_COUNT] = {RGB(24, 24, 27),    RGB(62, 62, 67),    RGB(36, 36, 40),    RGB(50, 50, 55),
+                                       RGB(48, 48, 53),    RGB(96, 96, 101),   RGB(245, 245, 247), RGB(161, 161, 166),
+                                       RGB(110, 110, 115), RGB(10, 132, 255),  RGB(255, 159, 10),  RGB(46, 46, 51),
+                                       RGB(48, 209, 88)};
 static const COLORREF* P = LIGHT;
 static HBRUSH g_brush[R_COUNT];
 static bool g_dark;
 
-enum Font { F_KICKER, F_LIVE, F_HEAD, F_BODY, F_SMALL, F_BIG, F_TITLE, F_COUNT };
+enum Font { F_BRAND, F_CAPTION, F_HEAD, F_BODY, F_SMALL, F_STAT, F_TITLE, F_SECTION, F_ICON, F_ICONL, F_COUNT };
 static HFONT g_font[F_COUNT];
 
-// Bố cục theo 96 DPI. Dải #f5f5f7 từ BAND_Y; hai thẻ trắng bo 28 px.
-constexpr int WIN_W = 520, WIN_H = 1016, BAND_Y = 300, TRACK_X = 196, TRACK_W = 280, SEG_H = 30;
-static const RECT CARD_Q = {20, 320, 500, 540}, CARD_NET = {20, 556, 500, 726}, CARD_FILE = {20, 742, 500, 846},
-                  CARD_LOG = {20, 862, 500, 1000};
-static const int ROW_Y[4] = {384, 422, 460, 498}, NET_Y = 618;
-struct Ctl { HWND h; int x, y, w, h_; Font font; Role fg, bg; HWND parent; };  // fg = R_BLUE: nút chính tô xanh
-struct Seg { HWND h; int grp, idx, n, x, w, y; };  // rãnh phân đoạn của nhóm: x, w, y theo 96 DPI
+// Bố cục theo 96 DPI: thanh bên (tên app, các trang, trạng thái) và trang đang chọn ở bên phải.
+constexpr int WIN_W = 840, WIN_H = 440, X0 = 248, X1 = 812, BTN_X = X1 - 156, SEG_H = 30;  // BTN_X: nút ở mép phải của hàng
+enum Page { PG_HOME, PG_QUALITY, PG_REMOTE, PG_FILES, PG_VNC, PG_LOG };
+constexpr int PG_COUNT = PG_LOG + 1;
+static const struct { const wchar_t *name, *glyph; COLORREF tile; } NAV[PG_COUNT] = {  // glyph: mã của Segoe Fluent Icons
+    {L"Tổng quan", L"\xE80F", RGB(0, 122, 255)},         {L"Chất lượng hình", L"\xE714", RGB(175, 82, 222)},
+    {L"Truy cập từ xa", L"\xE774", RGB(40, 167, 69)},    {L"Chuyển file", L"\xE8B7", RGB(255, 149, 0)},
+    {L"iPhone (TrollVNC)", L"\xE8EA", RGB(88, 86, 214)}, {L"Nhật ký", L"\xE81C", RGB(142, 142, 147)}};
+struct Card { int page; RECT r; int rows, radius; bool dashed; };  // rows > 1: kẻ vạch giữa các hàng
+struct Ctl { HWND h; int x, y, w, h_; Font font; Role fg, bg; HWND parent; int page; bool off; };  // fg = R_BLUE: nút chính
+struct Seg { HWND h; int grp, idx, n, x, w, y, page; };  // rãnh phân đoạn của nhóm: x, w, y theo 96 DPI
+static std::vector<Card> g_cards;
 static std::vector<Ctl> g_ctls;
 static std::vector<Seg> g_segs;
-static HWND h_kicker, h_live, h_status, h_detail, h_acct, h_accbtn, h_kick, h_log, h_net, h_ddns, h_send, h_upd, h_vnc;
+static int g_page, g_mkpage = -1;  // trang đang xem; trang của điều khiển đang dựng (-1: luôn hiện: thanh bên, hộp thoại)
+static HWND h_status, h_detail, h_pair, h_kick, h_stat[4], h_cap[4], h_acct, h_accsub, h_accbtn, h_devs, h_forget, h_side,
+    h_upd, h_log, h_net, h_ddns, h_send, h_sendhint, h_vncname, h_vnc;
+static HWND g_hot;  // nút đang có chuột ở trên
+static HICON g_icon;
 static HWND g_dlg, h_dlgerr;  // hộp tạo/đổi tài khoản, tên miền, mã QR
 static void (*g_dlg_save)(HWND);  // nút Lưu / phím Enter của hộp có ô nhập
 static std::vector<HWND> g_dlg_edits;
-static int g_sel[5];
+static int g_sel[5], g_dot = -1;  // g_dot: màu chấm trạng thái (0 chưa có tài khoản, 1 chờ iPhone, 2 đang phát)
 static bool g_streaming;
 static ULONG_PTR g_gdip;
 
 static int S(int v) { return MulDiv(v, GetDpiForWindow(g_hwnd), 96); }
 static Gdiplus::Color gc(COLORREF c) { return Gdiplus::Color(255, GetRValue(c), GetGValue(c), GetBValue(c)); }
+static COLORREF mix(COLORREF a, COLORREF b, int pct) {  // a pha pct% màu b
+    auto m = [pct](int x, int y) { return x + (y - x) * pct / 100; };
+    return RGB(m(GetRValue(a), GetRValue(b)), m(GetGValue(a), GetGValue(b)), m(GetBValue(a), GetBValue(b)));
+}
 
 static void rrect(Gdiplus::Graphics& g, float x, float y, float w, float h, float r, COLORREF fill, COLORREF line = CLR_INVALID,
-                  float lw = 1) {
+                  float lw = 1, bool dash = false) {
     Gdiplus::GraphicsPath p;
     float d = std::min({r * 2, w, h});
     p.AddArc(x, y, d, d, 180, 90);
@@ -2550,6 +2568,7 @@ static void rrect(Gdiplus::Graphics& g, float x, float y, float w, float h, floa
     }
     if (line != CLR_INVALID) {
         Gdiplus::Pen pen(gc(line), lw);
+        if (dash) pen.SetDashStyle(Gdiplus::DashStyleDash);
         g.DrawPath(&pen, &p);
     }
 }
@@ -2569,6 +2588,7 @@ static void apply_theme() {
         if (g_brush[i]) DeleteObject(g_brush[i]);
         g_brush[i] = CreateSolidBrush(P[i]);
     }
+    if (h_log) SetWindowTheme(h_log, g_dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);  // thanh cuộn tối theo nền
     BOOL dark = g_dark;
     COLORREF cap = P[R_CANVAS], txt = P[R_INK], border = P[R_HAIR];
     for (HWND w : {g_hwnd, g_dlg}) {
@@ -2581,16 +2601,34 @@ static void apply_theme() {
     }
 }
 
+static const wchar_t* icon_face() {  // Windows 11: Segoe Fluent Icons; Windows 10 chỉ có Segoe MDL2 Assets (cùng mã ký tự)
+    static const wchar_t* face;
+    if (!face) {
+        LOGFONTW lf{};
+        lf.lfCharSet = DEFAULT_CHARSET;
+        wcscpy(lf.lfFaceName, L"Segoe Fluent Icons");
+        bool found = false;
+        HDC dc = GetDC(nullptr);
+        EnumFontFamiliesExW(dc, &lf, [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM p) -> int { return *(bool*)p = true, 0; },
+                            (LPARAM)&found, 0);
+        ReleaseDC(nullptr, dc);
+        face = found ? L"Segoe Fluent Icons" : L"Segoe MDL2 Assets";
+    }
+    return face;
+}
 static void layout() {
     auto mk = [](const wchar_t* face, int px, int weight) {
         return CreateFontW(-S(px), 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, face);
     };
     for (HFONT& f : g_font) if (f) DeleteObject(f), f = nullptr;
     const wchar_t *disp = L"Segoe UI Variable Display", *text = L"Segoe UI Variable Text";  // thay cho SF Pro
-    g_font[F_KICKER] = mk(disp, 19, FW_SEMIBOLD), g_font[F_LIVE] = mk(text, 12, FW_SEMIBOLD);
-    g_font[F_HEAD] = mk(disp, 34, FW_SEMIBOLD), g_font[F_BODY] = mk(text, 15, FW_NORMAL);
-    g_font[F_SMALL] = mk(text, 13, FW_NORMAL), g_font[F_BIG] = mk(disp, 44, FW_SEMIBOLD);
-    g_font[F_TITLE] = mk(disp, 19, FW_SEMIBOLD);
+    g_font[F_BRAND] = mk(disp, 15, FW_SEMIBOLD), g_font[F_CAPTION] = mk(text, 12, FW_NORMAL);
+    g_font[F_HEAD] = mk(disp, 26, FW_SEMIBOLD), g_font[F_BODY] = mk(text, 14, FW_NORMAL);
+    g_font[F_SMALL] = mk(text, 13, FW_NORMAL), g_font[F_STAT] = mk(disp, 24, FW_SEMIBOLD);
+    g_font[F_TITLE] = mk(disp, 24, FW_SEMIBOLD), g_font[F_SECTION] = mk(text, 13, FW_SEMIBOLD);
+    g_font[F_ICON] = mk(icon_face(), 13, FW_NORMAL), g_font[F_ICONL] = mk(icon_face(), 32, FW_NORMAL);
+    if (g_icon) DestroyIcon(g_icon);
+    g_icon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, S(28), S(28), 0);
     for (auto& c : g_ctls) {
         MoveWindow(c.h, S(c.x), S(c.y), S(c.w), S(c.h_), TRUE);
         SendMessageW(c.h, WM_SETFONT, (WPARAM)g_font[c.font], TRUE);
@@ -2603,17 +2641,37 @@ static void layout() {
     }
 }
 
+// Chuột vào/ra nút tự vẽ: vẽ lại để nút sáng lên như nút của Windows 11.
+static LRESULT CALLBACK hover_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (msg == WM_MOUSEMOVE && g_hot != h) {
+        if (g_hot) InvalidateRect(g_hot, nullptr, FALSE);
+        g_hot = h;
+        InvalidateRect(h, nullptr, FALSE);
+        TRACKMOUSEEVENT t{sizeof t, TME_LEAVE, h, 0};
+        TrackMouseEvent(&t);
+    } else if (msg == WM_MOUSELEAVE && g_hot == h) {
+        g_hot = nullptr;
+        InvalidateRect(h, nullptr, FALSE);
+    }
+    return DefSubclassProc(h, msg, wp, lp);
+}
 static HWND ctl(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id, Font f, Role fg, Role bg,
                HWND parent = nullptr) {
     if (!parent) parent = g_hwnd;
     HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 0, 0, parent, (HMENU)(INT_PTR)id,
                              GetModuleHandleW(nullptr), nullptr);
-    g_ctls.push_back({c, x, y, w, h, f, fg, bg, parent});
+    if (!wcscmp(cls, L"BUTTON") && (style & BS_TYPEMASK) == BS_OWNERDRAW) SetWindowSubclass(c, hover_proc, 1, 0);
+    g_ctls.push_back({c, x, y, w, h, f, fg, bg, parent, parent == g_hwnd ? g_mkpage : -1, false});
     return c;
 }
 static HWND label(const wchar_t* text, int x, int y, int w, int h, Font f, Role fg, Role bg, DWORD style = SS_LEFT,
                   HWND parent = nullptr) {
     return ctl(L"STATIC", text, style | SS_NOPREFIX, x, y, w, h, 0, f, fg, bg, parent);
+}
+static void card(RECT r, int rows = 1, int radius = 12, bool dashed = false) { g_cards.push_back({g_mkpage, r, rows, radius, dashed}); }
+static void page_title(const wchar_t* title, const wchar_t* sub) {
+    label(title, X0, 22, X1 - X0, 34, F_TITLE, R_INK, R_CANVAS);
+    if (sub) label(sub, X0, 60, X1 - X0, 20, F_SMALL, R_SLATE, R_CANVAS, SS_LEFT | SS_ENDELLIPSIS);
 }
 static LRESULT ctl_color(WPARAM wp, LPARAM lp) {  // chữ tĩnh, ô nhập: màu theo vai trò, nền trùng nền phía sau
     for (auto& c : g_ctls)
@@ -2624,58 +2682,96 @@ static LRESULT ctl_color(WPARAM wp, LPARAM lp) {  // chữ tĩnh, ô nhập: mà
         }
     return 0;
 }
-static void segmented(int grp, const wchar_t* title, std::initializer_list<const wchar_t*> items, int y = 0,
-                      int x = TRACK_X, int w = TRACK_W) {
-    if (!y) y = ROW_Y[grp];
-    label(title, 48, y + 6, 140, 20, F_SMALL, R_SLATE, R_CARD);
+// Một hàng trên thẻ: tên ở trái, các phân đoạn khít nhau trên một rãnh ở phải.
+static void segmented(int grp, const wchar_t* title, std::initializer_list<const wchar_t*> items, int row_y, int w) {
+    label(title, X0 + 20, row_y + 18, 220, 20, F_BODY, R_INK, R_CARD);
     int i = 0;
     for (auto s : items) {
         HWND h = CreateWindowExW(0, L"BUTTON", s, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, g_hwnd,
                                  (HMENU)(INT_PTR)(ID_SEG + grp * 10 + i), GetModuleHandleW(nullptr), nullptr);
-        g_segs.push_back({h, grp, i++, (int)items.size(), x, w, y});
+        SetWindowSubclass(h, hover_proc, 1, 0);
+        g_segs.push_back({h, grp, i++, (int)items.size(), X1 - 20 - w, w, row_y + 13, g_mkpage});
     }
 }
+static void apply_vis() {  // chỉ hiện điều khiển của trang đang xem (và của thanh bên)
+    auto put = [](HWND h, bool v) {
+        if (((GetWindowLongW(h, GWL_STYLE) & WS_VISIBLE) != 0) != v) ShowWindow(h, v ? SW_SHOWNA : SW_HIDE);
+    };
+    for (auto& c : g_ctls) if (c.parent == g_hwnd) put(c.h, (c.page < 0 || c.page == g_page) && !c.off);
+    for (auto& s : g_segs) put(s.h, s.page == g_page);
+}
+static void set_off(HWND h, bool off) {  // ẩn theo tình trạng (vd. nút Ngắt chỉ có khi đang phát)
+    for (auto& c : g_ctls) if (c.h == h && c.off != off) c.off = off, apply_vis();
+}
+static void show_page(int p) {
+    g_page = p;
+    apply_vis();
+    RedrawWindow(g_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);  // thẻ của trang mới, mục đang chọn ở thanh bên
+}
 
-// Nút tự vẽ: pill viền mảnh, pill xanh cho việc chính (Tạo tài khoản, Lưu), hoặc một phân đoạn trên rãnh xám.
+// Nút tự vẽ: mục thanh bên, nút viên thuốc (xanh: việc chính; xám: việc phụ) hoặc một phân đoạn trên rãnh xám.
 static void draw_item(const DRAWITEMSTRUCT* d) {
-    int w = d->rcItem.right, h = d->rcItem.bottom;
-    bool down = d->itemState & ODS_SELECTED, focus = d->itemState & ODS_FOCUS, off = d->itemState & ODS_DISABLED;
+    int w = d->rcItem.right, h = d->rcItem.bottom, id = (int)d->CtlID;
+    bool down = d->itemState & ODS_SELECTED, off = d->itemState & ODS_DISABLED, hot = d->hwndItem == g_hot && !off;
+    bool focus = (d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT);  // vòng focus chỉ khi đi bằng bàn phím
+    bool nav = id >= ID_NAV && id < ID_NAV + PG_COUNT, seg = id >= ID_SEG && id < ID_NAV;
     HDC m = CreateCompatibleDC(d->hDC);
     HBITMAP bmp = CreateCompatibleBitmap(d->hDC, w, h), old = (HBITMAP)SelectObject(m, bmp);
-    Role bg = R_CARD, role = R_INK;  // nền phía sau nút: phân đoạn luôn trên thẻ; nút pill theo chỗ đặt
+    Role bg = R_CARD, role = R_INK;  // nền phía sau nút: phân đoạn luôn trên thẻ; nút khác theo chỗ đặt
     for (auto& c : g_ctls) if (c.h == d->hwndItem) bg = c.bg, role = c.fg;
-    bool primary = role == R_BLUE && (int)d->CtlID < ID_SEG;
-    COLORREF fg = primary ? RGB(255, 255, 255) : P[off ? R_STEEL : R_INK];
+    bool primary = role == R_BLUE && !seg && !nav && !off;
     RECT all{0, 0, w, h};
-    FillRect(m, &all, g_brush[bg]);  // tô nền bằng GDI: GDI+ khử răng cưa sẽ pha mép với nền đen
+    FillRect(m, &all, g_brush[bg]);  // tô nền bằng GDI: GDI+ khử răng cưa sẽ pha mép với nền
     {
         Gdiplus::Graphics g(m);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        if ((int)d->CtlID >= ID_SEG) {
+        if (nav) {
+            bool cur = g_page == id - ID_NAV;
+            if (cur || hot || down) rrect(g, 0, 0, (float)w, (float)h, (float)S(8), cur || down ? P[R_SEL] : mix(P[R_CANVAS], P[R_SEL], 60));
+            if (cur) rrect(g, 0, h / 2.f - S(8), (float)S(3), (float)S(16), S(3) / 2.f, P[R_BLUE]);  // vạch xanh: trang đang xem
+            rrect(g, (float)S(12), (h - S(22)) / 2.f, (float)S(22), (float)S(22), (float)S(6), NAV[id - ID_NAV].tile);
+            if (focus) rrect(g, 1, 1, w - 2.f, h - 2.f, (float)S(8), CLR_INVALID, P[R_BLUE], 2);
+        } else if (seg) {
             const Seg* s = nullptr;
             for (auto& x : g_segs) if (x.h == d->hwndItem) s = &x;
             RECT r;
             GetWindowRect(d->hwndItem, &r);
             MapWindowPoints(nullptr, g_hwnd, (POINT*)&r, 2);
             float tx = s ? (float)(S(s->x) - r.left) : 0;  // rãnh của cả nhóm, toạ độ theo nút này
-            rrect(g, tx, 0, (float)S(s ? s->w : TRACK_W), (float)h, h / 2.f, P[R_TRACK]);
-            if (s && g_sel[s->grp] == s->idx) rrect(g, 2.5f, 2.5f, w - 5.f, h - 5.f, (h - 5) / 2.f, P[R_SEGON], P[R_HAIR]);
+            rrect(g, tx, 0, s ? (float)S(s->w) : (float)w, (float)h, h / 2.f, P[R_TRACK]);
+            bool sel = s && g_sel[s->grp] == s->idx;
+            if (sel || hot)
+                rrect(g, 2.5f, 2.5f, w - 5.f, h - 5.f, (h - 5) / 2.f, sel ? P[R_SEGON] : mix(P[R_TRACK], P[R_SEGON], 45),
+                      sel && !g_dark ? P[R_HAIR] : CLR_INVALID);
             if (focus) rrect(g, 1, 1, w - 2.f, h - 2.f, (h - 2) / 2.f, CLR_INVALID, P[R_BLUE], 2);
         } else if (primary) {
-            rrect(g, 0, 0, (float)w, (float)h, h / 2.f, down ? RGB(0, 92, 184) : P[R_BLUE]);
+            rrect(g, 0, 0, (float)w, (float)h, h / 2.f,
+                  down ? mix(P[R_BLUE], RGB(0, 0, 0), 20) : hot ? mix(P[R_BLUE], RGB(255, 255, 255), 12) : P[R_BLUE]);
             if (focus) rrect(g, 2, 2, w - 4.f, h - 4.f, (h - 4) / 2.f, CLR_INVALID, RGB(255, 255, 255), 1.5f);
-        } else {
-            rrect(g, 0.5f, 0.5f, w - 1.f, h - 1.f, h / 2.f, down ? P[R_BAND] : P[bg], P[off ? R_HAIR : R_STEEL]);
+        } else {  // nút phụ: xám trên thẻ trắng; trắng viền mảnh trên nền xám (như nút của macOS)
+            bool on_card = bg == R_CARD;
+            COLORREF f = on_card ? P[R_TRACK] : P[R_CARD];
+            rrect(g, 0.5f, 0.5f, w - 1.f, h - 1.f, (h - 1) / 2.f, down || hot ? mix(f, P[R_BAND], on_card ? 100 : 50) : f,
+                  on_card ? CLR_INVALID : P[R_HAIR]);
             if (focus) rrect(g, 1, 1, w - 2.f, h - 2.f, (h - 2) / 2.f, CLR_INVALID, P[R_BLUE], 2);
         }
     }
     wchar_t t[64];
     GetWindowTextW(d->hwndItem, t, 64);
     SetBkMode(m, TRANSPARENT);
-    SetTextColor(m, fg);
+    RECT tr{0, 0, w, h};
+    UINT fmt = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
     HFONT of = (HFONT)SelectObject(m, g_font[F_SMALL]);
-    RECT rc{0, 0, w, h};
-    DrawTextW(m, t, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (nav) {  // biểu tượng trắng trên ô màu, rồi tên trang
+        SelectObject(m, g_font[F_ICON]);
+        SetTextColor(m, RGB(255, 255, 255));
+        RECT ic{S(12), (h - S(22)) / 2, S(34), (h - S(22)) / 2 + S(22)};
+        DrawTextW(m, NAV[id - ID_NAV].glyph, -1, &ic, fmt);
+        SelectObject(m, g_font[F_BODY]);
+        tr.left = S(44), fmt = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
+    }
+    SetTextColor(m, primary ? RGB(255, 255, 255) : P[off ? R_STEEL : R_INK]);
+    DrawTextW(m, t, -1, &tr, fmt);
     SelectObject(m, of);
     BitBlt(d->hDC, 0, 0, w, h, m, 0, 0, SRCCOPY);
     SelectObject(m, old);
@@ -2700,13 +2796,33 @@ template <class F> static void buffered_paint(HWND h, F draw) {
     EndPaint(h, &ps);
 }
 static void paint(HWND h) {
-    buffered_paint(h, [](HDC m, RECT cr) {
-        RECT band{0, S(BAND_Y), cr.right, cr.bottom};
-        FillRect(m, &band, g_brush[R_BAND]);
-        Gdiplus::Graphics g(m);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        for (const RECT& c : {CARD_Q, CARD_NET, CARD_FILE, CARD_LOG})
-            rrect(g, (float)S(c.left), (float)S(c.top), (float)S(c.right - c.left), (float)S(c.bottom - c.top), (float)S(28), P[R_CARD]);
+    buffered_paint(h, [](HDC m, RECT) {
+        if (g_icon) DrawIconEx(m, S(20), S(20), g_icon, S(28), S(28), 0, nullptr, DI_NORMAL);
+        {
+            Gdiplus::Graphics g(m);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            Gdiplus::SolidBrush hair(gc(P[R_HAIR]));
+            for (auto& c : g_cards) {
+                if (c.page != g_page) continue;
+                float x = S(c.r.left) + .5f, y = S(c.r.top) + .5f, w = S(c.r.right - c.r.left) - 1.f, hh = S(c.r.bottom - c.r.top) - 1.f;
+                rrect(g, x, y, w, hh, (float)S(c.radius), c.dashed ? CLR_INVALID : P[R_CARD], P[c.dashed ? R_STEEL : R_HAIR],
+                      c.dashed ? 1.5f : 1.f, c.dashed);
+                for (int i = 1; i < c.rows; i++)  // vạch giữa các hàng, thụt vào như danh sách của Apple
+                    g.FillRectangle(&hair, S(c.r.left + 20), S(c.r.top + (c.r.bottom - c.r.top) * i / c.rows),
+                                    S(c.r.right - c.r.left - 20), 1);
+            }
+            Gdiplus::SolidBrush dot(gc(P[g_dot == 2 ? R_GREEN : g_dot == 1 ? R_BLUE : R_ORANGE]));
+            g.FillEllipse(&dot, S(24), S(WIN_H - 40), S(8), S(8));  // trạng thái ở chân thanh bên
+            if (g_page == PG_HOME) g.FillEllipse(&dot, S(270), S(57), S(12), S(12));
+        }
+        if (g_page == PG_FILES) {  // mũi tên tải lên giữa vùng kéo thả
+            SetBkMode(m, TRANSPARENT);
+            SetTextColor(m, P[R_STEEL]);
+            HFONT of = (HFONT)SelectObject(m, g_font[F_ICONL]);
+            RECT r{S(X0), S(112), S(X1), S(160)};
+            DrawTextW(m, L"\xE898", -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(m, of);
+        }
     });
 }
 
@@ -2718,10 +2834,9 @@ static void set_text(HWND h, const std::wstring& s) {  // chỉ vẽ lại khi �
 static void refresh_status() {
     static uint64_t pf, pb;
     static Session* ps;
-    bool acc = has_account();
-    std::wstring detail = acc ? L"Mở Remote Desk trên iPhone, quét mã QR hoặc đăng nhập."
-                              : L"Tạo tài khoản để iPhone đăng nhập vào PC này.";
-    bool live;
+    static int shown = -1;
+    bool acc = has_account(), live;
+    std::wstring where, st[4], cap1 = L"Mbps", cap3 = L"mã hoá";
     {
         std::lock_guard g(g_cmu);
         live = g_current;
@@ -2729,49 +2844,67 @@ static void refresh_status() {
             uint64_t f = g_current->frames, b = g_current->bytes;
             if (ps != g_current) pf = f, pb = b, ps = g_current;
             std::lock_guard g2(g_current->info_mu);
-            string enc = g_current->enc_name.substr(0, g_current->enc_name.find(" Encoder"));  // "NVIDIA HEVC Encoder MFT" -> "NVIDIA HEVC"
-            wchar_t d[256];
+            const string &en = g_current->enc_name, &ip = g_current->peer;
+            wchar_t mb[16];
+            swprintf(mb, 16, L"%.1f", (b - pb) * 8 / 1e6);
+            st[0] = std::to_wstring(f - pf), st[1] = mb;
+            st[2] = g_current->vw ? std::to_wstring(g_current->vw) + L"×" + std::to_wstring(g_current->vh) : L"–";
+            st[3] = en.find("HEVC") != string::npos || en.find("265") != string::npos ? L"HEVC" : L"H.264";
+            for (const char* v : {"NVIDIA", "Intel", "AMD"})
+                if (en.find(v) != string::npos) cap3 = L"mã hoá " + wide(v);
             int lm = g_current->live_mbps;
-            swprintf(d, 256, L"%ls%ls  ·  %d×%d  ·  %llu khung/s  ·  %.1f Mbps%ls  ·  %ls", wide(g_current->peer).c_str(),
-                     is_tailscale(g_current->peer) ? L" (Tailscale)" : L"", g_current->vw, g_current->vh,
-                     (unsigned long long)(f - pf), (b - pb) * 8 / 1e6,
-                     lm && lm < g_mbps ? (L" (tự hạ còn " + std::to_wstring(lm) + L")").c_str() : L"", wide(enc).c_str());
-            detail = d;
+            if (lm && lm < g_mbps) cap1 = L"Mbps, tự hạ còn " + std::to_wstring(lm);
+            where = L"iPhone ở " + wide(ip) +
+                    (is_tailscale(ip) ? L", qua Tailscale." : is_private(ip) ? L", trong mạng nhà." : L", từ Internet.");
             pf = f, pb = b;
         } else ps = nullptr;
     }
-    if (live != g_streaming) {
-        g_streaming = live;
-        ShowWindow(h_kicker, live ? SW_HIDE : SW_SHOW);
-        ShowWindow(h_live, live ? SW_SHOW : SW_HIDE);
-        EnableWindow(h_kick, live);
+    if ((int)live != shown) {  // đang phát: thông số và nút Ngắt thay cho nút ghép
+        shown = g_streaming = live;
+        set_off(h_pair, live);
+        set_off(h_kick, !live);
+        for (int i = 0; i < 4; i++) set_off(h_stat[i], !live), set_off(h_cap[i], !live);
+        set_off(h_sendhint, live);
         EnableWindow(h_send, live);
     }
-    set_text(h_status, live ? L"Đang phát tới iPhone." : L"Sẵn sàng kết nối.");
-    set_text(h_detail, detail);
+    int dot = live ? 2 : acc ? 1 : 0;
+    if (dot != g_dot) g_dot = dot, InvalidateRect(g_hwnd, nullptr, FALSE);
+    set_text(h_status, live ? L"Đang phát tới iPhone" : acc ? L"Sẵn sàng kết nối" : L"Chưa có tài khoản");
+    set_text(h_detail, live ? where
+                       : acc ? L"Trên iPhone, mở Remote Desk rồi chạm vào PC này. iPhone mới thì ghép bằng mã QR, "
+                               L"không cần nhập IP hay mật khẩu."
+                             : L"Tạo tài khoản ở dưới để iPhone đăng nhập vào PC này, hoặc ghép iPhone bằng mã QR.");
+    for (int i = 0; i < 4; i++) set_text(h_stat[i], st[i]);
+    set_text(h_cap[1], cap1);
+    set_text(h_cap[3], cap3);
+    set_text(h_side, live ? L"Đang phát tới iPhone" : L"Chờ iPhone kết nối");
+    set_text(h_acct, acc ? wide(account_user()) : L"Chưa có tài khoản");
+    set_text(h_accsub, acc ? L"iPhone đăng nhập bằng tài khoản này, ở nhà hay ở ngoài" : L"Cần để iPhone ở ngoài đăng nhập");
+    set_text(h_accbtn, acc ? L"Đổi tài khoản" : L"Tạo tài khoản");
+    for (auto& c : g_ctls)  // chưa có tài khoản: nút tạo tô xanh, là việc cần làm trước
+        if (c.h == h_accbtn && (c.fg == R_BLUE) != !acc) c.fg = acc ? R_INK : R_BLUE, InvalidateRect(h_accbtn, nullptr, FALSE);
+    size_t n = device_count();
+    set_text(h_devs, n ? std::to_wstring(n) + L" thiết bị vào thẳng, không phải nhập mật khẩu" : L"Chưa có thiết bị nào");
+    EnableWindow(h_forget, n > 0);
     string net;
     {
         std::lock_guard g(g_igdmu);
         net = g_netstatus;
     }
-    set_text(h_net, wide(net) + L"  ·  " + std::to_wstring(device_count()) + L" thiết bị đã đăng nhập");
-    set_text(h_acct, acc ? wide(account_user()) : L"Chưa tạo");
+    set_text(h_net, wide(net));
     Release up = latest_update();
-    ShowWindow(h_upd, up.tag.empty() && !g_updating ? SW_HIDE : SW_SHOW);
+    set_off(h_upd, up.tag.empty() && !g_updating);
     set_text(h_upd, g_updating ? L"Đang cập nhật…" : L"Cập nhật lên " + wide(up.tag));
     string dn = ddns_name();
-    set_text(h_ddns, dn.empty() ? L"Chưa đặt" : wide(dn));
-    string rfb;
+    set_text(h_ddns, dn.empty() ? L"Chưa đặt. Cần khi IP nhà hay đổi" : wide(dn));
+    string rfb, rname;
     {
         std::lock_guard g(g_rfbmu);
-        rfb = g_rfb_addr;
+        rfb = g_rfb_addr, rname = g_rfb_name;
     }
-    set_text(h_vnc, !rfb.empty() ? wide(rfb) : !g_vnc_addr.empty() ? wide(g_vnc_addr) : L"Chưa thấy iPhone");
-    set_text(h_accbtn, acc ? L"Đổi tài khoản" : L"Tạo tài khoản");
-    for (auto& c : g_ctls)  // chưa có tài khoản: nút tạo tô xanh, là việc cần làm trước
-        if (c.h == h_accbtn && (c.fg == R_BLUE) != !acc) c.fg = acc ? R_INK : R_BLUE, InvalidateRect(h_accbtn, nullptr, FALSE);
-    for (auto& c : g_ctls)
-        if (c.h == h_acct && (c.fg == R_SLATE) != !acc) c.fg = acc ? R_INK : R_SLATE, InvalidateRect(h_acct, nullptr, TRUE);
+    set_text(h_vncname, !rfb.empty() ? wide(rname) : !g_vnc_addr.empty() ? L"iPhone dùng lần trước" : L"Chưa thấy iPhone nào");
+    set_text(h_vnc, !rfb.empty() ? wide(rfb) + L", có trong mạng này"
+                    : !g_vnc_addr.empty() ? wide(g_vnc_addr) : L"Bật TrollVNC trên iPhone, hoặc bấm Điều khiển để nhập IP");
 }
 static void append_logs() {
     std::vector<string> q;
@@ -2886,7 +3019,12 @@ static void open_dialog(const wchar_t* cls, WNDPROC proc, const wchar_t* title, 
     AdjustWindowRectExForDpi(&rc, style, FALSE, WS_EX_DLGMODALFRAME, GetDpiForWindow(g_hwnd));
     GetWindowRect(g_hwnd, &o);
     int ww = rc.right - rc.left, hh = rc.bottom - rc.top;
-    SetWindowPos(g_dlg, nullptr, o.left + (o.right - o.left - ww) / 2, o.top + S(90), ww, hh, SWP_NOZORDER);
+    MONITORINFO mi{sizeof mi};
+    GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    RECT a = mi.rcWork;  // giữa cửa sổ chính, không lòi khỏi màn hình
+    int x = std::clamp((int)(o.left + (o.right - o.left - ww) / 2), (int)a.left, std::max((int)a.left, (int)a.right - ww));
+    int y = std::clamp((int)(o.top + (o.bottom - o.top - hh) / 2), (int)a.top, std::max((int)a.top, (int)a.bottom - hh));
+    SetWindowPos(g_dlg, nullptr, x, y, ww, hh, SWP_NOZORDER);
 }
 static void run_modal(HWND focus) {
     layout();
@@ -3463,7 +3601,11 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (LOWORD(wp) == ID_KICK) {
             std::lock_guard g(g_cmu);
             if (g_current) g_current->kick(4001, "PC đã ngắt kết nối");
-        } else if (LOWORD(wp) >= ID_SEG && HIWORD(wp) == BN_CLICKED) apply_setting((LOWORD(wp) - ID_SEG) / 10, (LOWORD(wp) - ID_SEG) % 10);
+        } else if (LOWORD(wp) >= ID_NAV && LOWORD(wp) < ID_NAV + PG_COUNT) {
+            show_page(LOWORD(wp) - ID_NAV);
+        } else if (LOWORD(wp) >= ID_SEG && LOWORD(wp) < ID_NAV && HIWORD(wp) == BN_CLICKED) {
+            apply_setting((LOWORD(wp) - ID_SEG) / 10, (LOWORD(wp) - ID_SEG) % 10);
+        }
         return 0;
     case WM_DROPFILES: {  // kéo file vào cửa sổ: gửi tới iPhone
         HDROP d = (HDROP)wp;
@@ -3521,51 +3663,96 @@ static void run_ui() {
     g_sel[0] = pick(RES_W, 4, g_width, 1), g_sel[1] = pick(FPS_V, 4, g_fps, 1), g_sel[2] = pick(RATE_V, 5, g_mbps, 2);
     g_sel[3] = g_hevc, g_sel[4] = g_remote;
 
-    // Phần trên, nền trắng: nhãn, tiêu đề lớn, một dòng phụ, tên tài khoản là "sản phẩm" ở giữa sân khấu
-    std::wstring ver = newer(RD_VERSION, "0") ? L"Remote Desk " + wide(RD_VERSION) : L"Remote Desk";
-    h_kicker = label(ver.c_str(), 40, 30, 250, 26, F_KICKER, R_INK, R_CANVAS);
-    h_live = label(L"TRỰC TIẾP", 40, 36, 250, 18, F_LIVE, R_ORANGE, R_CANVAS);
-    h_upd = ctl(L"BUTTON", L"", WS_TABSTOP | BS_OWNERDRAW, 300, 26, 180, 30, ID_UPDATE, F_SMALL, R_BLUE, R_CANVAS);
-    ShowWindow(h_upd, SW_HIDE);
-    ShowWindow(h_live, SW_HIDE);
-    h_status = label(L"", 40, 60, 440, 46, F_HEAD, R_INK, R_CANVAS);
-    h_detail = label(L"", 40, 108, 440, 22, F_BODY, R_SLATE, R_CANVAS, SS_LEFT | SS_ENDELLIPSIS);
-    label(L"TÀI KHOẢN", 40, 150, 200, 18, F_LIVE, R_SLATE, R_CANVAS);
-    h_acct = label(L"", 38, 170, 440, 60, F_BIG, R_INK, R_CANVAS, SS_LEFT | SS_ENDELLIPSIS);
-    h_accbtn = ctl(L"BUTTON", L"", WS_TABSTOP | BS_OWNERDRAW, 40, 246, 128, 32, ID_ACCOUNT, F_SMALL, R_INK, R_CANVAS);
-    h_kick = ctl(L"BUTTON", L"Ngắt kết nối", WS_TABSTOP | BS_OWNERDRAW, 178, 246, 116, 32, ID_KICK, F_SMALL, R_INK, R_CANVAS);
-    ctl(L"BUTTON", L"Ghép bằng mã QR", WS_TABSTOP | BS_OWNERDRAW, 304, 246, 150, 32, ID_PAIR, F_SMALL, R_BLUE, R_CANVAS);
-    EnableWindow(h_kick, FALSE);
+    // Thanh bên: tên app, các trang, nút cập nhật khi có bản mới, trạng thái ở chân
+    std::wstring ver = newer(RD_VERSION, "0") ? L"Phiên bản " + wide(RD_VERSION) : L"Bản tự build";
+    label(L"Remote Desk", 58, 19, 150, 20, F_BRAND, R_INK, R_CANVAS);
+    label(ver.c_str(), 58, 39, 150, 16, F_CAPTION, R_SLATE, R_CANVAS);
+    for (int i = 0; i < PG_COUNT; i++)
+        ctl(L"BUTTON", NAV[i].name, WS_TABSTOP | BS_OWNERDRAW, 10, 74 + i * 38, 200, 34, ID_NAV + i, F_BODY, R_INK, R_CANVAS);
+    h_upd = ctl(L"BUTTON", L"", WS_TABSTOP | BS_OWNERDRAW, 16, WIN_H - 96, 188, 32, ID_UPDATE, F_SMALL, R_BLUE, R_CANVAS);
+    h_side = label(L"", 40, WIN_H - 45, 170, 18, F_SMALL, R_SLATE, R_CANVAS, SS_LEFT | SS_ENDELLIPSIS);
 
-    // Dải #f5f5f7: thẻ chất lượng hình với ba nhóm phân đoạn, thẻ nhật ký
-    label(L"Chất lượng hình", 48, 342, 400, 26, F_TITLE, R_INK, R_CARD);
-    segmented(0, L"Độ phân giải", {L"720p", L"1080p", L"1440p", L"Gốc"});
-    segmented(1, L"Khung hình", {L"30", L"60", L"90", L"120"});
-    segmented(2, L"Bitrate (Mbps)", {L"5", L"10", L"20", L"30", L"50"});
-    segmented(3, L"Mã hoá", {L"H.264", L"HEVC"});
+    // Tổng quan: thẻ trạng thái (đang phát thì hiện thông số), tài khoản và thiết bị
+    g_mkpage = PG_HOME;
+    card({X0, 28, X1, 220}, 1, 16);
+    h_status = label(L"", 292, 44, 360, 36, F_HEAD, R_INK, R_CARD, SS_LEFT | SS_ENDELLIPSIS);
+    h_detail = label(L"", 272, 86, X1 - 24 - 272, 40, F_BODY, R_SLATE, R_CARD);
+    h_pair = ctl(L"BUTTON", L"Ghép iPhone bằng mã QR", WS_TABSTOP | BS_OWNERDRAW, 272, 160, 200, 36, ID_PAIR, F_SMALL, R_BLUE, R_CARD);
+    h_kick = ctl(L"BUTTON", L"Ngắt kết nối", WS_TABSTOP | BS_OWNERDRAW, X1 - 24 - 124, 46, 124, 32, ID_KICK, F_SMALL, R_INK, R_CARD);
+    const wchar_t* caps[4] = {L"khung/s", L"Mbps", L"độ phân giải", L"mã hoá"};
+    const int col[5] = {272, 380, 488, 660, 788};  // cột độ phân giải rộng hơn: "2560×1440" không dính sang cột bên
+    for (int i = 0; i < 4; i++) {
+        h_stat[i] = label(L"", col[i], 128, col[i + 1] - col[i] - 8, 34, F_STAT, R_INK, R_CARD, SS_LEFT | SS_ENDELLIPSIS);
+        h_cap[i] = label(caps[i], col[i], 164, col[i + 1] - col[i] - 8, 18, F_CAPTION, R_SLATE, R_CARD, SS_LEFT | SS_ENDELLIPSIS);
+    }
+    label(L"Tài khoản và thiết bị", X0 + 4, 240, 300, 20, F_SECTION, R_SLATE, R_CANVAS);
+    card({X0, 266, X1, 378}, 2);
+    h_acct = label(L"", X0 + 20, 274, 360, 20, F_BODY, R_INK, R_CARD, SS_LEFT | SS_ENDELLIPSIS);
+    h_accsub = label(L"", X0 + 20, 296, 360, 18, F_CAPTION, R_SLATE, R_CARD, SS_LEFT | SS_ENDELLIPSIS);
+    h_accbtn = ctl(L"BUTTON", L"", WS_TABSTOP | BS_OWNERDRAW, BTN_X, 278, 136, 32, ID_ACCOUNT, F_SMALL, R_INK, R_CARD);
+    label(L"Thiết bị đã đăng nhập", X0 + 20, 330, 360, 20, F_BODY, R_INK, R_CARD);
+    h_devs = label(L"", X0 + 20, 352, 360, 18, F_CAPTION, R_SLATE, R_CARD, SS_LEFT | SS_ENDELLIPSIS);
+    h_forget = ctl(L"BUTTON", L"Đăng xuất hết", WS_TABSTOP | BS_OWNERDRAW, BTN_X, 334, 136, 32, ID_FORGET, F_SMALL, R_INK, R_CARD);
 
-    // Thẻ truy cập từ xa: tự mở cổng router (UPnP) để iPhone ở ngoài vào thẳng, kèm số thiết bị đã đăng nhập
-    label(L"Truy cập từ xa", 48, 576, 400, 26, F_TITLE, R_INK, R_CARD);
-    segmented(4, L"Từ Internet", {L"Tắt", L"Bật"}, NET_Y, TRACK_X, 140);
-    ctl(L"BUTTON", L"Đăng xuất hết", WS_TABSTOP | BS_OWNERDRAW, 352, NET_Y, 124, 30, ID_FORGET, F_SMALL, R_INK, R_CARD);
-    label(L"Tên miền", 48, 662, 140, 20, F_SMALL, R_SLATE, R_CARD);
-    h_ddns = label(L"", 196, 662, 148, 20, F_SMALL, R_INK, R_CARD, SS_LEFT | SS_ENDELLIPSIS);
-    ctl(L"BUTTON", L"Đặt tên miền", WS_TABSTOP | BS_OWNERDRAW, 352, 656, 124, 30, ID_DDNS, F_SMALL, R_INK, R_CARD);
-    h_net = label(L"", 48, 698, 424, 20, F_SMALL, R_SLATE, R_CARD, SS_LEFT | SS_ENDELLIPSIS);
+    g_mkpage = PG_QUALITY;
+    page_title(L"Chất lượng hình", L"Đổi là iPhone thấy ngay, không phải kết nối lại.");
+    card({X0, 96, X1, 320}, 4);
+    segmented(0, L"Độ phân giải", {L"720p", L"1080p", L"1440p", L"Gốc"}, 96, 300);
+    segmented(1, L"Khung hình", {L"30", L"60", L"90", L"120"}, 152, 300);
+    segmented(2, L"Bitrate (Mbps)", {L"5", L"10", L"20", L"30", L"50"}, 208, 300);
+    segmented(3, L"Mã hoá", {L"H.264", L"HEVC"}, 264, 300);
+    label(L"Hình giật hay trễ thì hạ bitrate hoặc độ phân giải. HEVC nét hơn H.264 ở cùng bitrate. Mức 90 và 120 khung/s "
+          L"hiện chỉ ra khoảng 60 khung/s và kém nét hơn mức 60.",
+          X0 + 4, 334, X1 - X0 - 8, 36, F_CAPTION, R_SLATE, R_CANVAS);
 
-    // Thẻ chuyển file: gửi tới iPhone đang kết nối (hoặc kéo file vào cửa sổ), file iPhone gửi lên nằm trong Tải về\Remote Desk
-    label(L"Chuyển file", 48, 760, 140, 26, F_TITLE, R_INK, R_CARD);
-    h_send = ctl(L"BUTTON", L"Gửi tới iPhone", WS_TABSTOP | BS_OWNERDRAW, 196, 758, 140, 30, ID_SEND, F_SMALL, R_INK, R_CARD);
-    EnableWindow(h_send, FALSE);
-    ctl(L"BUTTON", L"Thư mục nhận", WS_TABSTOP | BS_OWNERDRAW, 352, 758, 124, 30, ID_RECVDIR, F_SMALL, R_INK, R_CARD);
+    // Truy cập từ xa: tự mở cổng router (UPnP) để iPhone ở ngoài vào thẳng
+    g_mkpage = PG_REMOTE;
+    page_title(L"Truy cập từ xa", L"Cho iPhone ở ngoài (4G, Wi‑Fi nơi khác) vào thẳng PC này bằng tài khoản.");
+    card({X0, 96, X1, 208}, 2);
+    segmented(4, L"Từ Internet", {L"Tắt", L"Bật"}, 96, 140);
+    label(L"Tên miền riêng", X0 + 20, 160, 360, 20, F_BODY, R_INK, R_CARD);
+    h_ddns = label(L"", X0 + 20, 182, 360, 18, F_CAPTION, R_SLATE, R_CARD, SS_LEFT | SS_ENDELLIPSIS);
+    ctl(L"BUTTON", L"Đặt tên miền", WS_TABSTOP | BS_OWNERDRAW, BTN_X, 164, 136, 32, ID_DDNS, F_SMALL, R_INK, R_CARD);
+    label(L"Tình trạng", X0 + 4, 228, 300, 20, F_SECTION, R_SLATE, R_CANVAS);
+    card({X0, 254, X1, 318});
+    h_net = label(L"", X0 + 20, 266, X1 - X0 - 40, 40, F_SMALL, R_INK, R_CARD);
 
-    // iPhone đã jailbreak có TrollVNC: xem và điều khiển iPhone ngay trên PC (tự tìm qua Bonjour)
-    label(L"iPhone (TrollVNC)", 48, 804, 140, 20, F_SMALL, R_SLATE, R_CARD);
-    h_vnc = label(L"", 196, 804, 148, 20, F_SMALL, R_INK, R_CARD, SS_LEFT | SS_ENDELLIPSIS);
-    ctl(L"BUTTON", L"Điều khiển", WS_TABSTOP | BS_OWNERDRAW, 352, 798, 124, 30, ID_VNC, F_SMALL, R_INK, R_CARD);
+    // Chuyển file: kéo file vào cửa sổ (trang nào cũng được) hoặc chọn file; file iPhone gửi lên nằm trong Tải về\Remote Desk
+    g_mkpage = PG_FILES;
+    page_title(L"Chuyển file", L"Gửi file qua lại với iPhone đang kết nối.");
+    card({X0, 96, X1, 268}, 1, 16, true);
+    label(L"Kéo file vào cửa sổ này để gửi tới iPhone", X0 + 2, 166, X1 - X0 - 4, 22, F_BODY, R_INK, R_CANVAS, SS_CENTER);
+    h_send = ctl(L"BUTTON", L"Chọn file…", WS_TABSTOP | BS_OWNERDRAW, (X0 + X1) / 2 - 60, 198, 120, 32, ID_SEND, F_SMALL, R_BLUE, R_CANVAS);
+    h_sendhint = label(L"Chỉ gửi được khi iPhone đang kết nối.", X0 + 2, 238, X1 - X0 - 4, 18, F_CAPTION, R_SLATE, R_CANVAS, SS_CENTER);
+    card({X0, 288, X1, 344});
+    label(L"File iPhone gửi lên", X0 + 20, 296, 360, 20, F_BODY, R_INK, R_CARD);
+    label(L"Lưu trong Tải về\\Remote Desk", X0 + 20, 318, 360, 18, F_CAPTION, R_SLATE, R_CARD);
+    ctl(L"BUTTON", L"Mở thư mục", WS_TABSTOP | BS_OWNERDRAW, BTN_X, 300, 136, 32, ID_RECVDIR, F_SMALL, R_INK, R_CARD);
 
-    label(L"Nhật ký", 48, 882, 400, 26, F_TITLE, R_INK, R_CARD);
-    h_log = ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 48, 914, 424, 74, 0, F_SMALL, R_SLATE, R_CARD);
+    // iPhone đã jailbreak có TrollVNC: xem và điều khiển ngay trên PC (tự tìm qua Bonjour)
+    g_mkpage = PG_VNC;
+    page_title(L"iPhone (TrollVNC)", L"Xem và điều khiển iPhone đã jailbreak có bật TrollVNC, trong cùng mạng Wi‑Fi.");
+    card({X0, 96, X1, 152});
+    h_vncname = label(L"", X0 + 20, 104, 360, 20, F_BODY, R_INK, R_CARD, SS_LEFT | SS_ENDELLIPSIS);
+    h_vnc = label(L"", X0 + 20, 126, 360, 18, F_CAPTION, R_SLATE, R_CARD, SS_LEFT | SS_ENDELLIPSIS);
+    ctl(L"BUTTON", L"Điều khiển", WS_TABSTOP | BS_OWNERDRAW, BTN_X, 108, 136, 32, ID_VNC, F_SMALL, R_BLUE, R_CARD);
+    label(L"Trong cửa sổ iPhone", X0 + 4, 172, 300, 20, F_SECTION, R_SLATE, R_CANVAS);
+    card({X0, 198, X1, 398}, 5);
+    const wchar_t* keys[5][2] = {{L"Chuột trái", L"Chạm; giữ và kéo để vuốt"}, {L"Chuột phải", L"Nút Home"},
+                                 {L"Chuột giữa", L"Nút nguồn (khoá màn hình)"}, {L"Cuộn chuột", L"Vuốt lên, xuống"},
+                                 {L"Ctrl + phím", L"Command + phím, như chép và dán"}};
+    for (int i = 0; i < 5; i++) {
+        label(keys[i][0], X0 + 20, 208 + i * 40, 200, 20, F_BODY, R_INK, R_CARD);
+        label(keys[i][1], X1 - 20 - 300, 209 + i * 40, 300, 20, F_SMALL, R_SLATE, R_CARD, SS_RIGHT);
+    }
+
+    g_mkpage = PG_LOG;
+    page_title(L"Nhật ký", nullptr);
+    card({X0, 72, X1, WIN_H - 28});
+    h_log = ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, X0 + 16, 84, X1 - X0 - 24, WIN_H - 28 - 84 - 10, 0,
+                F_SMALL, R_INK, R_CARD);
+    g_mkpage = -1;
+    apply_vis();
 
     layout();
     apply_theme();

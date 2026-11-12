@@ -233,8 +233,29 @@ enum SelfTest {
             p.deallocate()
         }
 
+        // Danh sách máy: PC đã lưu và PC đang thấy trong mạng cùng tên gộp thành một dòng
+        let ms = Machine<SavedHost, String>.merge([SavedHost(name: "PC-A", address: "1.2.3.4:8443"), SavedHost(name: "PC-B", address: "b:8443")],
+                                                 ["PC-B", "PC-C"], name: \.name, address: \.address, foundName: { $0 })
+        check(ms.map(\.name) == ["PC-A", "PC-B", "PC-C"] && ms[0].found == nil && ms[1].found == "PC-B" && ms[2].saved == nil
+              && ms[2].id == "mdns:PC-C" && ms[0].id == "1.2.3.4:8443", "gộp PC đã lưu với PC trong mạng")
+
         print(failed == 0 ? "self-test OK" : "self-test LỖI: \(failed)")
         usleep(300_000)  // cho simctl --console kịp đọc dòng cuối trước khi app thoát
         exit(failed == 0 ? 0 : 1)
+    }
+}
+
+/// Ảnh chụp giao diện trên CI (build.sh --test): màn điều khiển xoay ngang, bảng mở sẵn, không cần PC.
+struct DemoStream: View {
+    @StateObject private var session = Session(host: SavedHost(name: "MAY-CHOI-GAME", address: "192.168.0.102:8443"))
+
+    var body: some View {
+        StreamView(session: session, demo: true) {}
+            .onAppear {
+                if #available(iOS 16, *) {
+                    (UIApplication.shared.connectedScenes.first as? UIWindowScene)?
+                        .requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeRight))
+                }
+            }
     }
 }

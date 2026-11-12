@@ -469,6 +469,7 @@ struct EditTarget: Identifiable { let id: Int }
 
 struct StreamView: View {
     @ObservedObject var session: Session
+    var demo = false  // ảnh chụp giao diện trên CI: không có PC, giả đang phát, mở sẵn bảng
     var close: () -> Void
     @State private var user = ""
     @State private var pass = ""
@@ -540,7 +541,13 @@ struct StreamView: View {
         .onAppear {
             user = session.host.user ?? ""
             UIApplication.shared.isIdleTimerDisabled = true
-            session.connect()
+            if demo {
+                session.state = .streaming
+                session.link = LinkStats(fps: 60, ping: 12, mbps: 18.4, size: "1920×1080", enc: "NVIDIA HEVC", network: "Wi‑Fi")
+                panel = true
+            } else {
+                session.connect()
+            }
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
@@ -555,7 +562,7 @@ struct StreamView: View {
         Button { show(true) } label: {
             Image(systemName: "slider.horizontal.3").font(.system(size: 14, weight: .semibold)).frame(width: 46, height: 28)
         }
-        .foregroundStyle(Theme.overlayInk)
+        .foregroundStyle(.primary)
         .overlayTrack(14)
         .opacity(1 - session.barFade)
         .accessibilityLabel("Mở bảng điều khiển")
@@ -575,7 +582,7 @@ struct StreamView: View {
             } label: { Label("Xong", systemImage: "checkmark") }
         }
         .font(.text(13, .semibold))
-        .foregroundStyle(Theme.overlayInk)
+        .foregroundStyle(.primary)
         .padding(.horizontal, 14)
         .frame(height: 34)
         .overlayTrack(17)
@@ -591,18 +598,18 @@ struct StreamView: View {
             .foregroundStyle(Theme.ink)
             .padding(.horizontal, 28)
             .padding(.vertical, 20)
-            .card()
+            .glassCard()
         case .failed(let msg), .ended(let msg):
             VStack(spacing: 20) {
                 Text(msg).font(.text(17)).tracking(-0.37).foregroundStyle(Theme.ink).multilineTextAlignment(.center)
                 HStack(spacing: 12) {
-                    Button("Thử lại") { session.retry() }.buttonStyle(BluePill())
-                    Button("Đóng", action: close).buttonStyle(OutlinePill())
+                    Button("Thử lại") { session.retry() }.primaryStyle()
+                    Button("Đóng", action: close).secondaryStyle()
                 }
             }
             .padding(28)
             .frame(maxWidth: 380)
-            .card()
+            .glassCard()
         default:
             EmptyView()
         }
@@ -630,7 +637,7 @@ struct TransferBadge: View {
             Button(action: close) { Image(systemName: "xmark") }.accessibilityLabel("Đóng")
         }
         .font(.text(12, .medium))
-        .foregroundStyle(Theme.overlayInk)
+        .foregroundStyle(.primary)
         .padding(.horizontal, 14)
         .padding(.vertical, 7)
         .overlayTrack(16)
@@ -654,7 +661,7 @@ struct LinkBadge: View {
             }
         }
         .font(.text(12, .medium).monospacedDigit())
-        .foregroundStyle(Theme.overlayInk)
+        .foregroundStyle(.primary)
         .padding(.horizontal, 14)
         .padding(.vertical, 7)
         .overlayTrack(16)
@@ -663,7 +670,7 @@ struct LinkBadge: View {
 }
 
 /// Bảng điều khiển trượt từ cạnh trái (kiểu Panel của StarDesk): nút nhanh, chất lượng hình, điều khiển, hiển thị.
-/// Chiếm khoảng 1/3 màn ngang, cuộn được, chữ nhỏ; chạm ra ngoài là đóng.
+/// Tấm kính nổi cách mép, chiếm khoảng 1/3 màn ngang, cuộn được; chạm ra ngoài là đóng.
 struct ControlPanel: View {
     @ObservedObject var session: Session
     var close: () -> Void
@@ -679,6 +686,7 @@ struct ControlPanel: View {
 
     var body: some View {
         GeometryReader { g in
+            let shape = RoundedRectangle(cornerRadius: 28, style: .continuous)
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     header
@@ -689,11 +697,13 @@ struct ControlPanel: View {
                     gyro
                     connection
                 }
-                .padding(12)
-                .padding(.leading, g.safeAreaInsets.leading)
+                .padding(14)
             }
-            .frame(width: min(360, max(300, g.size.width * 0.42)) + g.safeAreaInsets.leading)
-            .background(Theme.band.opacity(0.96).ignoresSafeArea())
+            .frame(width: min(360, max(300, g.size.width * 0.42)))
+            .clipShape(shape)
+            .glass(shape)
+            .padding(.leading, max(10, g.safeAreaInsets.leading))  // nổi cách mép, tránh tai thỏ
+            .padding(.vertical, 10)
         }
     }
 
@@ -710,7 +720,7 @@ struct ControlPanel: View {
             Spacer(minLength: 0)
             Button(action: hide) { Image(systemName: "xmark").font(.system(size: 13, weight: .bold)).frame(width: 30, height: 30) }
                 .foregroundStyle(Theme.slate)
-                .background(Theme.card, in: Circle())
+                .background(Theme.fill, in: Circle())
                 .accessibilityLabel("Đóng bảng")
         }
     }
@@ -734,11 +744,11 @@ struct ControlPanel: View {
         Button(action: action) {
             VStack(spacing: 5) {
                 Image(systemName: icon).font(.system(size: 17, weight: .medium))
-                Text(title).font(.text(10, .medium)).lineLimit(1).minimumScaleFactor(0.8)
+                Text(title).font(.text(11, .medium)).lineLimit(1).minimumScaleFactor(0.75)
             }
             .foregroundStyle(tint)
-            .frame(maxWidth: .infinity, minHeight: 54)
-            .background(Theme.card, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .frame(maxWidth: .infinity, minHeight: 58)
+            .background(Theme.fill, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .accessibilityLabel(title)
     }
@@ -840,7 +850,7 @@ struct ControlPanel: View {
     }
 }
 
-/// Một nhóm trong bảng điều khiển: tiêu đề chữ hoa nhỏ, thẻ bo 16.
+/// Một nhóm trong bảng điều khiển: tiêu đề, nền xám trong bo 18 trên tấm kính.
 struct PanelSection<Content: View>: View {
     let title: String
     let content: Content
@@ -851,12 +861,12 @@ struct PanelSection<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title.uppercased()).font(.text(11, .semibold)).foregroundStyle(Theme.slate)
+            Text(title).font(.text(13, .semibold)).foregroundStyle(Theme.ink)
             content
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(Theme.fill, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 }
 
@@ -952,7 +962,6 @@ struct KeyEditor: View {
                         Text(KeyButton.keyHelp)
                     }
                 }
-                .listRowBackground(Theme.card)
 
                 if kind == .key {
                     Section {
@@ -967,7 +976,6 @@ struct KeyEditor: View {
                     } header: { Text("Cách bấm") } footer: {
                         Text("Bật/tắt: chạm một lần là giữ, chạm lại là nhả (ngồi, ngắm, chạy). Liên thanh: giữ là bấm lặp ~15 lần/giây. Kéo để xoay camera: dùng cho nút Bắn, vừa bắn vừa ngắm bằng một ngón. Chạm nền = bấm chuột: lúc nút đang bật, chạm vào màn hình là bấm chuột trái đúng chỗ đó (mở túi đồ, bản đồ; Genshin, Star Rail cần giữ ALT).")
                     }
-                    .listRowBackground(Theme.card)
                 } else {
                     Section {
                         Toggle("Cần nổi", isOn: $floating)
@@ -977,7 +985,6 @@ struct KeyEditor: View {
                     } header: { Text("Cần di chuyển") } footer: {
                         Text("Cần nổi: đặt ngón đâu gần cần cũng được, tâm cần dời theo ngón (dễ cho người mới). Tắt đi thì tâm cố định, bấm lệch là đi ngay (cho người đã quen).")
                     }
-                    .listRowBackground(Theme.card)
                 }
 
                 Section {
@@ -990,9 +997,7 @@ struct KeyEditor: View {
                         dismiss()
                     }
                 }
-                .listRowBackground(Theme.card)
             }
-            .formBackground(Theme.band)
             .navigationTitle("Sửa nút")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

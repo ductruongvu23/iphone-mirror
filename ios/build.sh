@@ -49,6 +49,33 @@ PY
     fi
     exit 1
   fi
+  # Ảnh chụp giao diện để soát (sáng, tối): danh sách trống; có máy (PC đã lưu nạp qua tham số, PC và iPhone giả
+  # quảng bá Bonjour trên máy Mac này); màn điều khiển xoay ngang mở sẵn bảng. Tải về ở artifact RemoteDesk-ios-screenshots.
+  mkdir -p build/shots
+  shot() {  # tên ảnh, rồi tham số cho app
+    local name=$1
+    shift
+    xcrun simctl launch "$UDID" vn.vdt.remotedesk ${1+"$@"} > /dev/null
+    sleep 6
+    xcrun simctl io "$UDID" screenshot "build/shots/$name.png" > /dev/null 2>&1 || true
+    xcrun simctl terminate "$UDID" vn.vdt.remotedesk 2>/dev/null || true
+  }
+  for mode in light dark; do
+    xcrun simctl ui "$UDID" appearance $mode
+    shot "empty-$mode"
+  done
+  hosts=$(printf '%s' '[{"name":"MAY-CHOI-GAME","address":"192.168.0.102:8443"},{"name":"PC văn phòng","address":"nha.duckdns.org:8443"}]' | xxd -p | tr -d '\n')
+  dns-sd -R "MAY-CHOI-GAME" _remotedesk._tcp local 8443 > /dev/null 2>&1 &
+  b1=$!
+  dns-sd -R "TrollVNC-60bdc162" _rfb._tcp local 5901 > /dev/null 2>&1 &
+  b2=$!
+  sleep 2
+  for mode in light dark; do
+    xcrun simctl ui "$UDID" appearance $mode
+    shot "home-$mode" -hosts "<$hosts>"
+    shot "stream-$mode" --demo-stream
+  done
+  kill $b1 $b2 2>/dev/null || true
   exit
 fi
 
