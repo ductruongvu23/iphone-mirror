@@ -90,7 +90,7 @@ struct ContentView: View {
                     .contextMenu { forget(m.saved) }
                 }
             } header: {
-                Text("Máy tính").font(.title3.weight(.semibold)).foregroundStyle(Theme.ink)
+                Text("Máy tính").font(.title3.weight(.semibold)).foregroundStyle(Theme.ink).textCase(nil)
             } footer: {
                 if !pcs.isEmpty { Text("Vuốt sang trái hoặc giữ lâu một máy đã lưu để quên nó.") }
             }
@@ -105,14 +105,13 @@ struct ContentView: View {
                         .contextMenu { forgetVNC(m.saved) }
                     }
                 } header: {
-                    Text("iPhone (TrollVNC)").font(.title3.weight(.semibold)).foregroundStyle(Theme.ink)
+                    Text("iPhone (TrollVNC)").font(.title3.weight(.semibold)).foregroundStyle(Theme.ink).textCase(nil)
                 } footer: {
                     Text("iPhone, iPad khác đã jailbreak và bật TrollVNC, cùng mạng Wi‑Fi. Nút Home, bàn phím và nút nguồn ở nút nhỏ giữa mép trên.")
                 }
             }
         }
         .listStyle(.insetGrouped)
-        .textCase(nil)  // tiêu đề nhóm giữ chữ thường, không viết hoa hết
         .sheet(item: $form, onDismiss: {
             if let p = pending { pending = nil; start(p.host, password: p.password) }
         }) { f in

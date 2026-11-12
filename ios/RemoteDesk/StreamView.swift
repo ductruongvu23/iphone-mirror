@@ -492,12 +492,12 @@ struct StreamView: View {
                 .sheet(isPresented: $pickPhotos) { PhotoPicker { session.send(files: $0) }.ignoresSafeArea() }
             // Giữa mép trên để trống (các mẫu keymap chừa chỗ): một nút nhỏ mở bảng, hoặc thanh sửa keymap
             VStack(spacing: 8) {
-                if session.editing { editBar } else { handle }
+                if session.editing { editBar } else if !panel { handle }  // bảng đang mở: nút mở bảng không ló ra cạnh bảng
                 if let tr = session.transfer {
                     TransferBadge(transfer: tr) { session.transfer = nil }
                 }
                 Spacer()
-                if session.stats != .off && session.state == .streaming {
+                if session.stats != .off && session.state == .streaming && !panel {  // thông số đã có ở đầu bảng
                     HStack {
                         LinkBadge(link: session.link, compact: session.stats == .compact)
                         Spacer()
@@ -702,7 +702,7 @@ struct ControlPanel: View {
             .frame(width: min(360, max(300, g.size.width * 0.42)))
             .clipShape(shape)
             .glass(shape)
-            .padding(.leading, max(10, g.safeAreaInsets.leading))  // nổi cách mép, tránh tai thỏ
+            .padding(.leading, 10)  // nổi cách mép; HStack cha đã chừa phần tai thỏ
             .padding(.vertical, 10)
         }
     }
