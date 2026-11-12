@@ -22,6 +22,8 @@
 #include <wincrypt.h>
 #include <ncrypt.h>
 #include <bcrypt.h>
+#define SCHANNEL_USE_BLACKLISTS  // SCH_CREDENTIALS (TLS 1.3) chỉ khai báo khi có cờ này
+#include <subauth.h>
 #include <schannel.h>
 #include <security.h>
 #include <windns.h>
@@ -758,8 +760,8 @@ struct Tls {
         in.append(b, n);
         return true;
     }
-    bool handshake() {
-        bool more = true;
+    bool handshake() {  // cũng dùng cho tin sau bắt tay của TLS 1.3 (khi đó "in" đã có sẵn dữ liệu)
+        bool more = in.empty();
         for (;;) {
             if (more && !recv_more()) return false;
             SecBuffer ib[2] = {{(ULONG)in.size(), SECBUFFER_TOKEN, in.data()}, {0, SECBUFFER_EMPTY, nullptr}};
@@ -788,14 +790,16 @@ struct Tls {
                 SecBuffer b[4] = {{(ULONG)in.size(), SECBUFFER_DATA, in.data()}, {}, {}, {}};
                 SecBufferDesc d{SECBUFFER_VERSION, 4, b};
                 SECURITY_STATUS r = DecryptMessage(&ctx, &d, 0, nullptr);
-                if (r == SEC_E_OK) {
+                if (r == SEC_E_OK || r == SEC_I_RENEGOTIATE) {
                     string extra;
                     for (auto& x : b) {
                         if (x.BufferType == SECBUFFER_DATA) plain.append((char*)x.pvBuffer, x.cbBuffer);
                         if (x.BufferType == SECBUFFER_EXTRA) extra.assign((char*)x.pvBuffer, x.cbBuffer);
                     }
                     in = extra;
-                    return true;
+                    if (r == SEC_E_OK) return true;
+                    if (in.empty() || !handshake()) return false;  // TLS 1.3: tin sau bắt tay (vd. KeyUpdate) đưa lại cho Schannel
+                    continue;
                 }
                 if (r != SEC_E_INCOMPLETE_MESSAGE) return false;  // hết phiên hoặc lỗi
             }
@@ -1490,7 +1494,12 @@ static bool igd_map(Igd& u) {
                           "</NewInternalPort><NewInternalClient>" + u.local + "</NewInternalClient><NewEnabled>1</NewEnabled>"
                           "<NewPortMappingDescription>Remote Desk</NewPortMappingDescription><NewLeaseDuration>" +
                           std::to_string(lease) + "</NewLeaseDuration>";
-            if (igd_call(u, "AddPortMapping", args, r)) { u.ext_port = port; return true; }
+            if (igd_call(u, "AddPortMapping", args, r)) {
+                u.ext_port = port;
+                size_t pr = args.find("TCP");  // đường hình UDP dùng cùng số cổng; router không cho thì hình đi TCP
+                igd_call(u, "AddPortMapping", args.replace(pr, 3, "UDP"), r);
+                return true;
+            }
             if (r.find("725") == string::npos) break;  // lỗi khác (vd. 718: cổng đã có máy khác dùng): thử cổng kế
         }
     return false;
@@ -1498,8 +1507,9 @@ static bool igd_map(Igd& u) {
 static void igd_unmap(const Igd& u) {
     if (!u.ext_port) return;
     string r;
-    igd_call(u, "DeletePortMapping", "<NewRemoteHost></NewRemoteHost><NewExternalPort>" + std::to_string(u.ext_port) +
-                                         "</NewExternalPort><NewProtocol>TCP</NewProtocol>", r);
+    for (const char* proto : {"TCP", "UDP"})
+        igd_call(u, "DeletePortMapping", "<NewRemoteHost></NewRemoteHost><NewExternalPort>" + std::to_string(u.ext_port) +
+                                             "</NewExternalPort><NewProtocol>" + proto + "</NewProtocol>", r);
 }
 static void set_netstatus(const string& m) {
     std::lock_guard g(g_igdmu);
@@ -1627,7 +1637,7 @@ static void remote_loop() {
         next = Clock::now() + std::chrono::minutes(1);  // lỗi thì một phút sau thử lại
         ddns_update();  // trước cả UPnP: router không có UPnP vẫn chuyển cổng tay được
         Igd u;
-        if (!igd_discover(u)) { set_netstatus("Router không bật UPnP: tự chuyển cổng TCP " + port + " về " + lan + " trên router."); continue; }
+        if (!igd_discover(u)) { set_netstatus("Router không bật UPnP: tự chuyển cổng TCP và UDP " + port + " về " + lan + " trên router."); continue; }
         if (!igd_map(u)) { set_netstatus("Router từ chối mở cổng " + port + " (UPnP)."); continue; }
         string wan = u.ext_ip;  // IP phía Internet của router này
         bool two = wan.empty() || is_private(wan);
@@ -1637,7 +1647,7 @@ static void remote_loop() {
         if (two && !told) {
             string modem = wan.substr(0, wan.rfind('.') + 1) + "1";
             logf("Nhà có 2 lớp router: modem nhà mạng (thường là %s) → router %s → PC. Đã tự mở cổng trên router trong. "
-                 "Còn một việc làm tay một lần: vào trang quản trị modem, chuyển cổng TCP %d về %s:%d (hoặc đặt DMZ = %s).",
+                 "Còn một việc làm tay một lần: vào trang quản trị modem, chuyển cổng TCP và UDP %d về %s:%d (hoặc đặt DMZ = %s).",
                  modem.c_str(), wan.c_str(), u.ext_port, wan.c_str(), u.ext_port, wan.c_str());
             told = true;
         }
@@ -1723,6 +1733,153 @@ static std::filesystem::path unique_path(const std::filesystem::path& dir, const
 }
 
 // ======================= Phiên điều khiển =======================
+// ======================= Đường hình UDP: mã hoá AES-256-GCM từng gói, mã sửa lỗi Reed-Solomon =======================
+// Qua TCP (WebSocket + TLS), mất một gói là cả luồng phải chờ gửi lại: 4G chập chờn thì hình giật. Đường UDP chia mỗi khung
+// thành gói ~1,2 KB kèm 20% gói dư (Reed-Solomon): mất vài gói vẫn dựng lại được khung, không phải chờ.
+// Bảo mật (Moonlight/Sunshine mã hoá hình bằng AES-GCM, Parsec dùng DTLS):
+//  - Mỗi phiên một khoá AES-256 và mã phiên ngẫu nhiên, gửi cho iPhone bên trong TLS (chứng chỉ PC đã được ghim).
+//  - Mỗi gói mã hoá và xác thực bằng AES-GCM. Nonce = hướng (4 byte) + số thứ tự gói (8 byte) như RFC 5116, không bao
+//    giờ lặp. Phần đầu gói (loại, mã phiên, số thứ tự) không mã hoá nhưng được xác thực (AAD).
+//  - Cửa sổ chống phát lại 64 gói (như IPsec). Gói hỏng, sai khoá, phát lại đều bị bỏ.
+//  - Chống bị lợi dụng làm khuếch đại (như QUIC): PC chỉ gửi hình tới địa chỉ vừa chứng minh có khoá VÀ trả đúng thử thách
+//    ngẫu nhiên PC gửi tới chính địa chỉ đó. Trước đó chỉ trả một gói ACK nhỏ hơn gói nhận được.
+//  - Mỗi khoá tối đa 2^27 gói (giới hạn an toàn của AES-GCM với gói ≤ 2 KB là 2^28, RFC 9001), quá thì quay về TCP.
+// Gói: [loại 1][0 1][mã phiên 4][số thứ tự 8] | bản mã | nhãn xác thực 16.
+namespace udp {
+enum : uint8_t { HELLO = 1, ACK = 2, VIDEO = 3, FEEDBACK = 4 };
+constexpr int HDR = 14, TAG = 16, VHDR = 14, SHARD = 1200, KMAX = 200, FEC = 20;  // FEC: % gói dư mỗi khối
+constexpr uint32_t DOWN = 1, UP = 2;  // hướng trong nonce: PC→iPhone, iPhone→PC
+constexpr uint64_t MAXSEQ = 1ull << 27;
+}  // namespace udp
+static SOCKET g_udp = INVALID_SOCKET;
+
+static void put_be(uint8_t* p, uint64_t v, int n) { for (int i = n - 1; i >= 0; i--) p[i] = (uint8_t)v, v >>= 8; }
+static uint64_t get_be(const uint8_t* p, int n) {
+    uint64_t v = 0;
+    for (int i = 0; i < n; i++) v = v << 8 | p[i];
+    return v;
+}
+static string b64(const uint8_t* p, size_t n) {
+    DWORD m = 0;
+    CryptBinaryToStringA(p, (DWORD)n, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &m);
+    string o(m, '\0');
+    CryptBinaryToStringA(p, (DWORD)n, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, o.data(), &m);
+    o.resize(m);
+    return o;
+}
+
+// AES-256-GCM bằng BCrypt (AES-NI). Mỗi luồng một đối tượng: một khoá BCrypt không dùng chung giữa các luồng.
+struct Gcm {
+    BCRYPT_KEY_HANDLE k = nullptr;
+    explicit Gcm(const uint8_t key[32]) {
+        static BCRYPT_ALG_HANDLE alg = [] {
+            BCRYPT_ALG_HANDLE a = nullptr;
+            BCryptOpenAlgorithmProvider(&a, BCRYPT_AES_ALGORITHM, nullptr, 0);
+            BCryptSetProperty(a, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof BCRYPT_CHAIN_MODE_GCM, 0);
+            return a;
+        }();
+        BCryptGenerateSymmetricKey(alg, &k, nullptr, 0, (PUCHAR)key, 32, 0);
+    }
+    ~Gcm() { if (k) BCryptDestroyKey(k); }
+    bool run(bool enc, const uint8_t* nonce, const uint8_t* aad, ULONG na, const uint8_t* in, ULONG n, uint8_t* out, uint8_t* tag) {
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO ai;
+        BCRYPT_INIT_AUTH_MODE_INFO(ai);
+        ai.pbNonce = (PUCHAR)nonce, ai.cbNonce = 12, ai.pbAuthData = (PUCHAR)aad, ai.cbAuthData = na;
+        ai.pbTag = tag, ai.cbTag = udp::TAG;
+        ULONG got = 0;
+        return (enc ? BCryptEncrypt(k, (PUCHAR)in, n, &ai, nullptr, 0, out, n, &got, 0)
+                    : BCryptDecrypt(k, (PUCHAR)in, n, &ai, nullptr, 0, out, n, &got, 0)) == 0 && got == n;
+    }
+};
+static void nonce_of(uint8_t n[12], uint32_t dir, uint64_t seq) { put_be(n, dir, 4), put_be(n + 4, seq, 8); }
+static string seal_packet(Gcm& g, uint8_t type, uint32_t sid, uint64_t seq, uint32_t dir, const uint8_t* body, size_t n) {
+    string p(udp::HDR + n + udp::TAG, '\0');
+    uint8_t* b = (uint8_t*)p.data();
+    b[0] = type;
+    put_be(b + 2, sid, 4), put_be(b + 6, seq, 8);
+    uint8_t nonce[12];
+    nonce_of(nonce, dir, seq);
+    return g.run(true, nonce, b, udp::HDR, body, (ULONG)n, b + udp::HDR, b + udp::HDR + n) ? p : string();
+}
+static bool open_packet(Gcm& g, uint32_t dir, const uint8_t* p, size_t n, std::vector<uint8_t>& body) {
+    if (n <= (size_t)(udp::HDR + udp::TAG)) return false;
+    body.resize(n - udp::HDR - udp::TAG);
+    uint8_t nonce[12];
+    nonce_of(nonce, dir, get_be(p + 6, 8));
+    return g.run(false, nonce, p, udp::HDR, p + udp::HDR, (ULONG)body.size(), body.data(), const_cast<uint8_t*>(p + n - udp::TAG));
+}
+
+// Cửa sổ chống phát lại 64 gói như IPsec: gói đã nhận hoặc cũ hơn cửa sổ thì bỏ. Chỉ ghi nhận gói đã xác thực.
+struct Replay {
+    uint64_t top = 0, bits = 0;
+    bool check(uint64_t s) const { return s && (s > top || (top - s < 64 && !(bits >> (top - s) & 1))); }
+    void accept(uint64_t s) {
+        if (s > top) bits = s - top >= 64 ? 1 : bits << (s - top) | 1, top = s;
+        else bits |= 1ull << (top - s);
+    }
+};
+
+// GF(256), đa thức 0x11D. Mã Cauchy hệ thống: mảnh dư i = Σ_j c(i,j)·mảnh dữ liệu j, c(i,j) = 1/((K+i) XOR j).
+// Mọi ma trận con vuông của ma trận Cauchy khả nghịch, nên nhận đủ K mảnh bất kỳ trong K+M là dựng lại được khung.
+struct Gf {
+    uint8_t mul[256][256], inv[256];
+    Gf() {
+        uint8_t ex[512], lg[256]{};
+        for (int i = 0, x = 1; i < 255; i++) {
+            ex[i] = ex[i + 255] = (uint8_t)x, lg[x] = (uint8_t)i;
+            x <<= 1;
+            if (x & 0x100) x ^= 0x11D;
+        }
+        for (int a = 0; a < 256; a++)
+            for (int b = 0; b < 256; b++) mul[a][b] = a && b ? ex[lg[a] + lg[b]] : 0;
+        inv[0] = 0;
+        for (int a = 1; a < 256; a++) inv[a] = ex[255 - lg[a]];
+    }
+};
+static const Gf& gf() {
+    static Gf g;
+    return g;
+}
+static void rs_parity(const std::vector<const uint8_t*>& data, int k, int m, size_t len, std::vector<std::vector<uint8_t>>& par) {
+    const Gf& g = gf();
+    par.assign(m, std::vector<uint8_t>(len, 0));
+    for (int i = 0; i < m; i++)
+        for (int j = 0; j < k; j++) {
+            const uint8_t* row = g.mul[g.inv[(uint8_t)((k + i) ^ j)]];
+            const uint8_t* d = data[j];
+            uint8_t* o = par[i].data();
+            for (size_t t = 0; t < len; t++) o[t] ^= row[d[t]];
+        }
+}
+// Một khung (byte cờ + dữ liệu, giống gói WebSocket) thành các mảnh. Mảnh: [số khung 4][độ dài khung 4][khối][số khối]
+// [chỉ số mảnh][K][M][0] rồi SHARD byte. Khung lớn (khung khoá) chia khối ≤ KMAX mảnh dữ liệu (K+M ≤ 255).
+static void udp_shards(uint32_t frame, const string& msg, std::vector<std::vector<uint8_t>>& out) {
+    out.clear();
+    size_t per = (size_t)udp::KMAX * udp::SHARD, blocks = (msg.size() + per - 1) / per;
+    for (size_t b = 0; b < blocks; b++) {
+        size_t off = b * per, len = std::min(per, msg.size() - off);
+        int k = (int)((len + udp::SHARD - 1) / udp::SHARD), m = std::max(1, (k * udp::FEC + 99) / 100);
+        std::vector<std::vector<uint8_t>> data(k, std::vector<uint8_t>(udp::SHARD, 0));
+        std::vector<const uint8_t*> ptr;
+        for (int j = 0; j < k; j++) {
+            memcpy(data[j].data(), msg.data() + off + (size_t)j * udp::SHARD, std::min<size_t>(udp::SHARD, len - (size_t)j * udp::SHARD));
+            ptr.push_back(data[j].data());
+        }
+        std::vector<std::vector<uint8_t>> par;
+        rs_parity(ptr, k, m, udp::SHARD, par);
+        for (int i = 0; i < k + m; i++) {
+            std::vector<uint8_t> v(udp::VHDR + udp::SHARD);
+            put_be(&v[0], frame, 4), put_be(&v[4], msg.size(), 4);
+            v[8] = (uint8_t)b, v[9] = (uint8_t)blocks, v[10] = (uint8_t)i, v[11] = (uint8_t)k, v[12] = (uint8_t)m;
+            memcpy(&v[udp::VHDR], i < k ? data[i].data() : par[i - k].data(), udp::SHARD);
+            out.push_back(std::move(v));
+        }
+    }
+}
+static bool same_addr(const sockaddr_in& a, const sockaddr_in& b) {
+    return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+}
+
 struct Session;
 static std::mutex g_cmu;
 static Session* g_current = nullptr;
@@ -1736,6 +1893,40 @@ struct Session {
     string enc_name, peer = "?";
     int vw = 0, vh = 0;
     bool client_hevc = false;  // client báo giải mã được HEVC
+    // Đường hình UDP (app iPhone báo "udp"): khoá và mã phiên mới cho mỗi phiên, gửi cho iPhone trong TLS
+    bool udp_want = false;
+    uint8_t ukey[32]{};
+    uint32_t usid = 0;
+    std::atomic<uint64_t> useq{0}, usent{0};  // số thứ tự gói PC gửi (luồng hình và luồng UDP cùng tăng); số mảnh hình đã gửi
+    std::atomic<uint32_t> ufno{0};            // số khung gửi qua UDP, liên tục qua các lần phát lại
+    std::mutex umu;                           // các trường dưới: luồng UDP ghi, luồng hình đọc
+    sockaddr_in upeer{}, ucand{};             // địa chỉ đã xác minh; địa chỉ đang chờ trả thử thách
+    uint64_t uchal = 0;
+    bool uvalid = false;
+    Replay urep;
+    ULONGLONG ulast = 0;                      // lúc nhận gói hợp lệ gần nhất; im 3 giây thì quay về TCP
+    uint32_t fb_recv = 0, fb_fixed = 0, fb_lost = 0;  // iPhone báo (cộng dồn): mảnh nhận, mảnh dựng lại nhờ FEC, khung mất
+    ~Session() { SecureZeroMemory(ukey, sizeof ukey); }
+    bool udp_on() {
+        std::lock_guard g(umu);
+        return uvalid && GetTickCount64() - ulast < 3000 && useq < udp::MAXSEQ;
+    }
+    // Gửi một khung qua UDP. Khung lớn (khung khoá) giãn ra sau 64 gói, 32 gói mỗi ms, để không tràn hàng đợi router/4G.
+    void udp_send(Gcm& g, const string& msg, std::vector<std::vector<uint8_t>>& shards) {
+        sockaddr_in to;
+        {
+            std::lock_guard l(umu);
+            to = upeer;
+        }
+        udp_shards(++ufno, msg, shards);
+        int i = 0;
+        for (auto& b : shards) {
+            string p = seal_packet(g, udp::VIDEO, usid, ++useq, udp::DOWN, b.data(), b.size());
+            sendto(g_udp, p.data(), (int)p.size(), 0, (sockaddr*)&to, sizeof to);
+            if (++i >= 64 && i % 32 == 0) Sleep(1);
+        }
+        usent += shards.size();
+    }
     explicit Session(SOCKET s) : t(s) {
         sockaddr_in a{};
         int n = sizeof a;
@@ -1801,11 +1992,26 @@ struct Session {
             }
             qc.notify_one();
         });
+        std::unique_ptr<Gcm> ug;  // khoá mã hoá gói hình của luồng này
+        if (udp_want) ug = std::make_unique<Gcm>(ukey);
+        std::vector<std::vector<uint8_t>> shards;
+        bool via_udp = false;
+        uint64_t sent0 = 0;  // số đếm đầu cửa sổ một giây để tính tỉ lệ mất gói của đường UDP
+        uint32_t recv0 = 0, lost0 = 0;
         auto send = [&]() {
             for (auto& o : out) {
                 auto t0 = Clock::now();
                 // byte đầu: bit 0 = khung khoá, bit 1 = HEVC
-                if (!ws_send(t, 2, string(1, (char)(is_key(o, enc.hevc) | (enc.hevc ? 2 : 0))) + o)) return false;
+                string msg = string(1, (char)(is_key(o, enc.hevc) | (enc.hevc ? 2 : 0))) + o;
+                if (bool u = ug && udp_on(); u != via_udp) {  // đổi đường: xin khung khoá để iPhone giải lại từ đầu
+                    via_udp = u, want_key = true;
+                    sent0 = usent;
+                    std::lock_guard l(umu);
+                    recv0 = fb_recv, lost0 = fb_lost;
+                    logf(u ? "Hình đi đường UDP, mã hoá AES-256-GCM, 20%% gói dư" : "Quay về gửi hình qua TCP");
+                }
+                if (via_udp) udp_send(*ug, msg, shards);
+                else if (!ws_send(t, 2, msg)) return false;
                 busy += Clock::now() - t0;
                 frames++, bytes += o.size();
             }
@@ -1824,6 +2030,17 @@ struct Session {
             if (!send()) { stop = true; break; }
             if (auto now = Clock::now(); now - win >= std::chrono::seconds(1)) {  // mỗi giây: mạng có theo kịp bitrate không
                 double frac = std::chrono::duration<double>(busy).count() / std::chrono::duration<double>(now - win).count();
+                if (via_udp) {  // gửi UDP không bị chặn: dựa vào iPhone báo mất. Mất khung (FEC không cứu nổi) thì hạ, mất >5% gói thì giữ
+                    uint64_t sent = usent;
+                    uint32_t rcv, lost;
+                    {
+                        std::lock_guard l(umu);
+                        rcv = fb_recv, lost = fb_lost;
+                    }
+                    double loss = sent > sent0 ? 1.0 - double(rcv - recv0) / double(sent - sent0) : 0;
+                    frac = lost != lost0 ? 1.0 : loss > 0.05 ? 0.3 : 0.0;
+                    sent0 = sent, recv0 = rcv, lost0 = lost;
+                }
                 int want = adapt_bitrate(cur, mbps, frac, calm);
                 if (want != cur && enc.setv(CODECAPI_AVEncCommonMeanBitRate, want * 1000000)) {
                     logf(want < cur ? "Mạng chậm: hạ bitrate %d → %d Mbps" : "Mạng ổn lại: nâng bitrate %d → %d Mbps", cur, want);
@@ -1961,6 +2178,8 @@ struct Session {
         jstr(m, "pair", pair);
         size_t hv = jfind(m, "hevc");
         client_hevc = hv != string::npos && m.compare(hv, 4, "true") == 0;
+        size_t uv = jfind(m, "udp");
+        udp_want = g_udp != INVALID_SOCKET && uv != string::npos && m.compare(uv, 4, "true") == 0;
         bool local = is_private(peer);
         if (auth_locked(peer)) {
             ws_send(t, 1, R"({"t":"locked"})");
@@ -2003,6 +2222,12 @@ struct Session {
         }
         auth_ok(peer);
         if (!local && issued.empty()) logf("Thiết bị đã đăng nhập vào từ Internet (%s)", peer.c_str());
+        string udpj;  // khoá đường hình UDP: chỉ gửi trong TLS, mới cho mỗi phiên
+        if (udp_want) {
+            BCryptGenRandom(nullptr, ukey, sizeof ukey, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            while (!usid) BCryptGenRandom(nullptr, (PUCHAR)&usid, sizeof usid, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            udpj = R"(,"udp":{"key":")" + b64(ukey, sizeof ukey) + R"(","sid":)" + std::to_string(usid) + "}";
+        }
         {
             std::lock_guard g(g_cmu);
             if (g_current) g_current->kick(4000, "client khác đã kết nối");
@@ -2012,7 +2237,7 @@ struct Session {
         string addrs;  // mọi địa chỉ của PC (LAN, Tailscale, IP công khai) để app tự chọn khi ở nhà hay ở ngoài
         for (auto& a : client_addrs()) addrs += (addrs.empty() ? "\"" : ",\"") + a + "\"";
         ws_send(t, 1, R"({"t":"hello","addrs":[)" + addrs + "]" + (issued.empty() ? "" : R"(,"token":")" + issued + "\"") +
-                          R"(,"keymap":)" + (km.empty() ? string("null") : km) + "}");
+                          R"(,"keymap":)" + (km.empty() ? string("null") : km) + udpj + "}");
         std::thread vt(&Session::video, this);
         while (ws_read(t, op, m)) {
             string ty;
@@ -2053,6 +2278,59 @@ struct Session {
         if (g_current == this) g_current = nullptr;
     }
 };
+
+// Luồng nhận UDP: gói HELLO/FEEDBACK của iPhone. Bỏ gói lạ trước khi giải mã; địa chỉ mới phải trả đúng thử thách
+// (gửi kèm ACK, không lớn hơn gói nhận) thì hình mới chuyển sang đó.
+static void udp_loop() {
+    using namespace udp;
+    std::vector<uint8_t> body;
+    std::unique_ptr<Gcm> g;
+    uint32_t gsid = 0;
+    char buf[2048];
+    for (;;) {
+        sockaddr_in from{};
+        int fl = sizeof from;
+        int n = recvfrom(g_udp, buf, sizeof buf, 0, (sockaddr*)&from, &fl);
+        if (n == SOCKET_ERROR) {
+            if (WSAGetLastError() != WSAECONNRESET) Sleep(10);  // ICMP "cổng đóng" sau một lần gửi: bỏ qua
+            continue;
+        }
+        const uint8_t* p = (const uint8_t*)buf;
+        if (n < HDR + 8 + TAG || (p[0] != HELLO && p[0] != FEEDBACK) || from.sin_family != AF_INET) continue;
+        uint32_t sid = (uint32_t)get_be(p + 2, 4);
+        uint64_t seq = get_be(p + 6, 8);
+        std::lock_guard l(g_cmu);  // giữ phiên sống trong lúc xử lý
+        Session* s = g_current;
+        if (!s || !s->udp_want || sid != s->usid) continue;
+        {
+            std::lock_guard u(s->umu);
+            if (!s->urep.check(seq)) continue;
+        }
+        if (!g || gsid != sid) g = std::make_unique<Gcm>(s->ukey), gsid = sid;
+        if (!open_packet(*g, UP, p, n, body)) continue;  // sai khoá hoặc bị sửa
+        std::lock_guard u(s->umu);
+        if (!s->urep.check(seq)) continue;
+        s->urep.accept(seq);
+        s->ulast = GetTickCount64();
+        if (s->uvalid && same_addr(from, s->upeer)) {
+            if (body.size() >= 20) s->fb_recv = (uint32_t)get_be(&body[8], 4), s->fb_fixed = (uint32_t)get_be(&body[12], 4),
+                                   s->fb_lost = (uint32_t)get_be(&body[16], 4);
+            continue;
+        }
+        if (s->uchal && get_be(body.data(), 8) == s->uchal && same_addr(from, s->ucand)) {  // trả đúng thử thách
+            s->upeer = from, s->uvalid = true, s->uchal = 0;
+            continue;
+        }
+        if (!s->uchal || !same_addr(from, s->ucand)) {
+            s->ucand = from;
+            while (!s->uchal) BCryptGenRandom(nullptr, (PUCHAR)&s->uchal, sizeof s->uchal, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        }
+        uint8_t ch[8];
+        put_be(ch, s->uchal, 8);
+        string a = seal_packet(*g, ACK, sid, ++s->useq, DOWN, ch, sizeof ch);
+        sendto(g_udp, a.data(), (int)a.size(), 0, (sockaddr*)&from, sizeof from);
+    }
+}
 
 // PC gửi file: báo iPhone đang kết nối, iPhone tự tải về qua GET /file. Chạy ở luồng riêng: gửi tin có thể chờ luồng hình.
 static void offer_files(std::vector<std::wstring> paths) {
@@ -2175,12 +2453,27 @@ static SOCKET listen_on(int port) {
 static bool setup_tls(const std::wstring& cn, bool& created) {
     g_cert = ensure_cert(cn, local_ips(), created);
     if (!g_cert) return false;
-    SCHANNEL_CRED sc{};
-    sc.dwVersion = SCHANNEL_CRED_VERSION;
+    // TLS 1.3 (và 1.2 cho máy cũ) qua SCH_CREDENTIALS (Windows 10 1809+); SCHANNEL_CRED kiểu cũ không bật được TLS 1.3.
+    // Chỉ bộ mã mạnh (SCH_USE_STRONG_CRYPTO); khoá chứng chỉ là khoá CNG nên ký RSA-PSS được như TLS 1.3 đòi.
+    TLS_PARAMETERS tp{};
+    tp.grbitDisabledProtocols = ~(DWORD)(SP_PROT_TLS1_2_SERVER | SP_PROT_TLS1_3_SERVER);
+    SCH_CREDENTIALS sc{};
+    sc.dwVersion = SCH_CREDENTIALS_VERSION;
     sc.cCreds = 1;
     sc.paCred = &g_cert;
-    sc.grbitEnabledProtocols = SP_PROT_TLS1_2_SERVER;
-    return AcquireCredentialsHandleW(nullptr, (LPWSTR)UNISP_NAME_W, SECPKG_CRED_INBOUND, nullptr, &sc, nullptr, nullptr,
+    sc.dwFlags = SCH_USE_STRONG_CRYPTO;
+    sc.cTlsParameters = 1;
+    sc.pTlsParameters = &tp;
+    if (AcquireCredentialsHandleW(nullptr, (LPWSTR)UNISP_NAME_W, SECPKG_CRED_INBOUND, nullptr, &sc, nullptr, nullptr, &g_cred,
+                                  nullptr) == SEC_E_OK)
+        return true;
+    SCHANNEL_CRED old{};  // Windows cũ hơn: TLS 1.2
+    old.dwVersion = SCHANNEL_CRED_VERSION;
+    old.cCreds = 1;
+    old.paCred = &g_cert;
+    old.grbitEnabledProtocols = SP_PROT_TLS1_2_SERVER;
+    old.dwFlags = SCH_USE_STRONG_CRYPTO;
+    return AcquireCredentialsHandleW(nullptr, (LPWSTR)UNISP_NAME_W, SECPKG_CRED_INBOUND, nullptr, &old, nullptr, nullptr,
                                      &g_cred, nullptr) == SEC_E_OK;
 }
 
@@ -2854,8 +3147,8 @@ static void refresh_status() {
                 if (en.find(v) != string::npos) cap3 = L"mã hoá " + wide(v);
             int lm = g_current->live_mbps;
             if (lm && lm < g_mbps) cap1 = L"Mbps, tự hạ còn " + std::to_wstring(lm);
-            where = L"iPhone ở " + wide(ip) +
-                    (is_tailscale(ip) ? L", qua Tailscale." : is_private(ip) ? L", trong mạng nhà." : L", từ Internet.");
+            where = L"iPhone ở " + wide(ip) + (is_tailscale(ip) ? L", qua Tailscale" : is_private(ip) ? L", trong mạng nhà" : L", từ Internet") +
+                    (g_current->udp_on() ? L". Hình qua UDP, mã hoá AES-256." : L". Hình qua TCP (TLS).");
             pf = f, pb = b;
         } else ps = nullptr;
     }
@@ -4043,6 +4336,42 @@ static int self_test() {
         CHECK(!t.rect(reader(msg, pos), 4, 4, px));  // PNG của TightPNG (không xin) bị từ chối
         deflateEnd(&zs[0]), deflateEnd(&zs[1]);
     }
+    // Đường hình UDP: AES-256-GCM (vector tính bằng thư viện cryptography của Python), gói bị sửa, chống phát lại,
+    // Reed-Solomon (vector của bản tham chiếu Python), chia khung thành mảnh
+    {
+        uint8_t k[32];
+        for (int i = 0; i < 32; i++) k[i] = (uint8_t)i;
+        Gcm g(k);
+        const char* pt = "Remote Desk UDP";
+        string pk = seal_packet(g, udp::VIDEO, 0x11223344, 5, udp::DOWN, (const uint8_t*)pt, 15);
+        CHECK(pk.size() == 45 && hexs((const uint8_t*)pk.data() + 14, 31) == "ece3007a1ac3b52a8603e2c3764b21b88de1d7badc42b837129c7641d41333");
+        std::vector<uint8_t> body;
+        CHECK(open_packet(g, udp::DOWN, (const uint8_t*)pk.data(), pk.size(), body) && string(body.begin(), body.end()) == pt);
+        CHECK(!open_packet(g, udp::UP, (const uint8_t*)pk.data(), pk.size(), body));  // sai hướng = sai nonce
+        for (int at : {3, 20, 44}) {  // sửa một bit ở phần đầu, bản mã, nhãn: đều bị từ chối
+            pk[at] ^= 1;
+            CHECK(!open_packet(g, udp::DOWN, (const uint8_t*)pk.data(), pk.size(), body));
+            pk[at] ^= 1;
+        }
+        Replay r;
+        CHECK(!r.check(0) && r.check(5));
+        r.accept(5);
+        CHECK(!r.check(5) && r.check(4) && r.check(6));
+        r.accept(100);
+        CHECK(!r.check(5) && !r.check(36) && r.check(37) && !r.check(100) && r.check(101));
+        r.accept(37);
+        CHECK(!r.check(37) && r.check(38));
+        uint8_t d0[] = {1, 2, 3, 4}, d1[] = {0x10, 0x20, 0x30, 0x40}, d2[] = {0xAA, 0xBB, 0xCC, 0xDD};
+        std::vector<std::vector<uint8_t>> par;
+        rs_parity({d0, d1, d2}, 3, 2, 4, par);
+        CHECK(hexs(par[0].data(), 4) == "565ed50a" && hexs(par[1].data(), 4) == "d66d1018");
+        std::vector<std::vector<uint8_t>> sh;
+        udp_shards(7, string(3000, 'x'), sh);  // 3000 byte: 3 mảnh dữ liệu (1200, 1200, 600 + đệm) + 1 mảnh dư
+        CHECK(sh.size() == 4 && sh[0].size() == udp::VHDR + udp::SHARD && get_be(&sh[3][0], 4) == 7 && get_be(&sh[3][4], 4) == 3000);
+        CHECK(sh[3][10] == 3 && sh[3][11] == 3 && sh[3][12] == 1 && sh[2][udp::VHDR + 599] == 'x' && sh[2][udp::VHDR + 600] == 0);
+        udp_shards(8, string(500000, 'y'), sh);  // khung khoá lớn: 3 khối (200 + 200 + 17 mảnh dữ liệu)
+        CHECK(sh.size() == 240 + 240 + 21 && sh[480][8] == 2 && sh[480][9] == 3 && sh[480][11] == 17 && sh[480][12] == 4);
+    }
     // Chụp màn hình (chỉ đọc)
     Capture cap;
     CHECK(cap.init());
@@ -4117,6 +4446,17 @@ int main(int argc, char** argv) {
     SOCKET l = listen_on(g_port);
     if (l == INVALID_SOCKET) return fail(L"Không mở được cổng " + std::to_wstring(g_port) + L" (có thể app đang chạy rồi).");
     logf("Đang nghe cổng %d", g_port);
+    g_udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);  // đường hình UDP, cùng số cổng
+    sockaddr_in ua{};
+    ua.sin_family = AF_INET, ua.sin_port = htons((u_short)g_port);
+    if (bind(g_udp, (sockaddr*)&ua, sizeof ua)) {
+        closesocket(g_udp), g_udp = INVALID_SOCKET;
+        logf("Không mở được cổng UDP %d: hình chỉ đi qua TCP", g_port);
+    } else {
+        int sb = 1 << 20;  // đủ chứa một khung khoá đang giãn ra
+        setsockopt(g_udp, SOL_SOCKET, SO_SNDBUF, (char*)&sb, sizeof sb);
+        std::thread(udp_loop).detach();
+    }
     for (auto& ip : reachable_ips())
         logf("%s: https://%s:%d", is_tailscale(ip) ? "Tailscale (ở ngoài)" : "Safari trong mạng nhà", ip.c_str(), g_port);
     mdns_register();

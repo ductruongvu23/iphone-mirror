@@ -250,6 +250,7 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
     private var sendQueue: [URL] = [], sending = false
     private var progressObs: NSKeyValueObservation?
     private var onWiFi = true
+    private var udp: UDPVideo?  // đường hình UDP mã hoá; nil: hình chỉ đi qua TCP
 
     init(host: SavedHost, password: String? = nil, pairCode: String? = nil) {
         self.host = host
@@ -291,10 +292,12 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
     /// Mở kết nối tới địa chỉ thứ `attempt`; thất bại thì closed() chuyển sang địa chỉ kế tiếp.
     private func open() {
         task?.cancel(with: .goingAway, reason: nil)
+        udp?.stop()
+        udp = nil
         current = candidates[attempt]
         let last = attempt + 1 >= candidates.count
         // Tin đăng nhập: khoá thiết bị nếu đã có, tài khoản nếu vừa nhập mật khẩu, và báo giải mã được HEVC
-        var auth: [String: Any] = ["hevc": true]
+        var auth: [String: Any] = ["hevc": true, "udp": true]
         if let tok = Keychain.get(host.address) { auth["token"] = tok }
         if let password, !password.isEmpty {
             auth["user"] = host.user ?? ""
@@ -325,6 +328,8 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
         timer = nil
         task?.cancel(with: .normalClosure, reason: nil)
         task = nil
+        udp?.stop()
+        udp = nil
     }
 
     func retry(user: String? = nil, password: String? = nil) {
@@ -409,6 +414,7 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
         case .tailscale: link.network = "Tailscale"
         case .lan: link.network = current.hasPrefix("172.20.10.") ? "Hotspot / cáp USB" : "Wi‑Fi / LAN"
         }
+        if udp?.active == true { link.network += ", UDP" }
     }
 
     private func receive(_ t: URLSessionWebSocketTask) {
@@ -444,6 +450,7 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
                 if let addrs, !addrs.isEmpty { host.addresses = addrs }
                 password = nil  // đã có khoá thiết bị: không giữ mật khẩu, mã QR nữa
                 pairCode = nil
+                startUDP(m["udp"] as? [String: Any])
                 onHostUpdate?(host)
             case "badlogin":
                 state = .badLogin
@@ -466,6 +473,19 @@ final class Session: NSObject, ObservableObject, Identifiable, URLSessionWebSock
             default: break
             }
         }
+    }
+
+    /// PC gửi khoá đường hình UDP trong lời chào (đi trong TLS). Khung UDP vào cùng hàng đợi với khung TCP.
+    private func startUDP(_ u: [String: Any]?) {
+        udp?.stop()
+        udp = nil
+        guard let u, let key = (u["key"] as? String).flatMap({ Data(base64Encoded: $0) }),
+              let sid = (u["sid"] as? Int).flatMap({ UInt32(exactly: $0) }), let v = UDPVideo(address: current, key: key, sid: sid) else { return }
+        let q = urlSession.delegateQueue
+        v.onFrame = { [weak self] d in q.addOperation { self?.renderer.enqueue(d) } }
+        v.onNeedKey = { [weak self] in DispatchQueue.main.async { self?.send(["t": "key"]) } }
+        udp = v
+        v.start()
     }
 
     private func closed(_ t: URLSessionWebSocketTask, _ error: Error) {

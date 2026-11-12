@@ -1,4 +1,5 @@
 import CoreMedia
+import CryptoKit
 import SwiftUI
 import UIKit
 import zlib
@@ -239,6 +240,79 @@ enum SelfTest {
                                                  ["PC-B", "PC-C"], name: \.name, address: \.address, foundName: { $0 })
         check(ms.map(\.name) == ["PC-A", "PC-B", "PC-C"] && ms[0].found == nil && ms[1].found == "PC-B" && ms[2].saved == nil
               && ms[2].id == "mdns:PC-C" && ms[0].id == "1.2.3.4:8443", "gộp PC đã lưu với PC trong mạng")
+
+        // Đường hình UDP: AES-256-GCM và Reed-Solomon cùng vector với bản PC, gói bị sửa / sai hướng, chống phát lại,
+        // dựng khung khi rớt gói, mất cả khung thì xin khung khoá và bỏ khung sau cho tới khung khoá
+        let k32 = SymmetricKey(data: Data((0..<32).map { UInt8($0) }))
+        let pkt = UDPVideo.seal(key: k32, kind: 3, sid: 0x1122_3344, seq: 5, dir: UDPVideo.down, body: Data("Remote Desk UDP".utf8))
+        check(pkt.count == 45 && pkt.suffix(31).map { String(format: "%02x", $0) }.joined()
+              == "ece3007a1ac3b52a8603e2c3764b21b88de1d7badc42b837129c7641d41333", "UDP: AES-256-GCM khớp bản PC")
+        check(UDPVideo.open(key: k32, dir: UDPVideo.down, packet: pkt)?.1 == Data("Remote Desk UDP".utf8), "UDP: mở gói")
+        var bad1 = pkt, bad2 = pkt
+        bad1[3] ^= 1
+        bad2[44] ^= 1
+        check(UDPVideo.open(key: k32, dir: UDPVideo.down, packet: bad1) == nil && UDPVideo.open(key: k32, dir: UDPVideo.down, packet: bad2) == nil
+              && UDPVideo.open(key: k32, dir: UDPVideo.up, packet: pkt) == nil, "UDP: gói bị sửa hoặc sai hướng bị từ chối")
+        var rw = ReplayWindow()
+        var replayOK = !rw.check(0) && rw.check(5)
+        rw.accept(5)
+        replayOK = replayOK && !rw.check(5) && rw.check(4) && rw.check(6)
+        rw.accept(100)
+        replayOK = replayOK && !rw.check(5) && !rw.check(36) && rw.check(37) && !rw.check(100) && rw.check(101)
+        check(replayOK, "UDP: cửa sổ chống phát lại")
+        check(UDPVideo.split("192.168.1.6:8443").map { $0 == ("192.168.1.6", 8443) } == true
+              && UDPVideo.split("[fe80::1]:8443").map { $0 == ("fe80::1", 8443) } == true
+              && UDPVideo.split("nha.duckdns.org:9000").map { $0 == ("nha.duckdns.org", 9000) } == true && UDPVideo.split("x") == nil,
+              "UDP: tách địa chỉ")
+        let d3 = [Data([1, 2, 3, 4]), Data([0x10, 0x20, 0x30, 0x40]), Data([0xAA, 0xBB, 0xCC, 0xDD])]
+        let p2 = ReedSolomon.parity(d3, m: 2)
+        check(p2 == [Data([0x56, 0x5E, 0xD5, 0x0A]), Data([0xD6, 0x6D, 0x10, 0x18])], "Reed-Solomon: mảnh dư khớp bản PC")
+        var sh3: [Int: Data] = [1: d3[1], 3: p2[0], 4: p2[1]]
+        check(ReedSolomon.recover(&sh3, k: 3, m: 2) == 2 && (0..<3).map { sh3[$0] } == d3.map { Optional($0) }, "Reed-Solomon: dựng lại 2 mảnh")
+        var rsOK = true
+        for _ in 0..<30 {
+            let k = Int.random(in: 1...40), m = Int.random(in: 1...10)
+            let data = (0..<k).map { _ in Data((0..<64).map { _ in UInt8.random(in: 0...255) }) }
+            var all = [Int: Data]()
+            for (i, d) in (data + ReedSolomon.parity(data, m: m)).enumerated() { all[i] = d }
+            for i in Array(0..<(k + m)).shuffled().prefix(m) { all[i] = nil }
+            rsOK = rsOK && ReedSolomon.recover(&all, k: k, m: m) != nil && (0..<k).allSatisfy { all[$0] == data[$0] }
+        }
+        check(rsOK, "Reed-Solomon: mất ngẫu nhiên tới M mảnh vẫn dựng lại được")
+        func shards(_ f: UInt32, _ msg: Data) -> [Data] {  // chia khung như bản PC
+            let per = UDPVideo.kmax * UDPVideo.shard, nb = (msg.count + per - 1) / per
+            var out: [Data] = []
+            for b in 0..<nb {
+                let block = msg.subdata(in: (b * per)..<min(msg.count, (b + 1) * per))
+                let k = (block.count + UDPVideo.shard - 1) / UDPVideo.shard, m = max(1, (k * 20 + 99) / 100)
+                let data = (0..<k).map { j -> Data in
+                    var d = block.subdata(in: (j * UDPVideo.shard)..<min(block.count, (j + 1) * UDPVideo.shard))
+                    d.append(Data(count: UDPVideo.shard - d.count))
+                    return d
+                }
+                for (i, sh) in (data + ReedSolomon.parity(data, m: m)).enumerated() {
+                    var h = Data()
+                    h.appendBE(UInt64(f), 4)
+                    h.appendBE(UInt64(msg.count), 4)
+                    h.append(contentsOf: [UInt8(b), UInt8(nb), UInt8(i), UInt8(k), UInt8(m), 0])
+                    out.append(h + sh)
+                }
+            }
+            return out
+        }
+        let fa = FrameAssembler()
+        var got: [Data] = [], asked = 0
+        let key1 = Data([1]) + Data((0..<3000).map { UInt8($0 & 255) }), p1 = Data([0]) + Data(repeating: 7, count: 500)
+        let key6 = Data([1]) + Data(repeating: 9, count: 20)
+        func feed(_ list: [Data], _ t: Double) { for x in list { fa.add(x, now: t, deliver: { got.append($0) }, needKey: { asked += 1 }) } }
+        let s1 = shards(1, key1)
+        feed([s1[0], s1[2], s1[3]], 0)  // khung khoá 3 mảnh + 1 dư, rớt mảnh 1: dựng lại được
+        feed([shards(2, p1)[1]], 0.01)  // khung 2 chỉ còn mảnh dư (K = 1): vẫn đủ
+        feed(shards(4, p1), 0.2)        // khung 3 mất hẳn; khung 4 chờ
+        feed(shards(5, p1), 0.35)       // quá 80 ms: khung 3 coi như mất, xin khung khoá, bỏ khung 4, 5
+        feed(shards(6, key6), 0.4)
+        check(got == [key1, p1, key6] && asked == 1 && fa.lost == 1 && fa.fixed == 2, "UDP: dựng khung, mất khung thì chờ khung khoá")
+        print("self-test: xong đường hình UDP")
 
         print(failed == 0 ? "self-test OK" : "self-test LỖI: \(failed)")
         usleep(300_000)  // cho simctl --console kịp đọc dòng cuối trước khi app thoát
