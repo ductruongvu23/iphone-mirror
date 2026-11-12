@@ -74,7 +74,7 @@ jobs:
           base = "https://github.com/$GITHUB_REPOSITORY"
           json.dump({"name": "Remote Desk", "identifier": "vn.vdt.remotedesk.source", "website": base, "apps": [{
               "name": "Remote Desk", "bundleIdentifier": "vn.vdt.remotedesk", "developerName": "$GITHUB_REPOSITORY_OWNER",
-              "localizedDescription": "Điều khiển PC Windows từ iPhone: hình HEVC độ trễ thấp, keymap cho game, chuyển file.",
+              "localizedDescription": "Điều khiển PC Windows từ iPhone: hình HEVC độ trễ thấp, keymap cho game, chuyển file, điều khiển iPhone có TrollVNC.",
               "iconURL": "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/ios/RemoteDesk/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
               "versions": [{"version": "${TAG#v}", "date": "$(date -u +%Y-%m-%d)", "size": os.path.getsize(ipa),
                             "downloadURL": base + "/releases/download/$TAG/" + ipa, "minOSVersion": "15.0"}],
@@ -95,9 +95,10 @@ jobs:
 
           **Dùng lần đầu**
           1. Trên PC: chạy bộ cài (hoặc giải nén zip) rồi mở Remote Desk, tạo tài khoản, cho phép qua Windows Firewall.
-          2. Trên PC bấm "Ghép bằng mã QR", trên iPhone bấm "Quét mã QR trên PC" (hoặc dùng app Camera). Không cần IP hay mật khẩu; lần sau app tự vào, ở nhà hay ở ngoài.
-          3. Muốn dùng ở ngoài: bật "Từ Internet" trên cửa sổ PC (cần mở cổng TCP 8443 trên router/modem). Đặt "Tên miền" (DDNS, ví dụ DuckDNS miễn phí) để IP nhà đổi vẫn vào được, và để thêm PC từ xa khi không quét được mã: nhập tên miền + tài khoản.
+          2. Trên PC (trang Tổng quan) bấm "Ghép iPhone bằng mã QR", trên iPhone bấm "Quét mã QR trên PC" (hoặc nút + góc trên, hoặc app Camera). Không cần IP hay mật khẩu; lần sau chỉ cần chạm vào PC trong danh sách, ở nhà hay ở ngoài.
+          3. Muốn dùng ở ngoài: trang "Truy cập từ xa" của PC, bật "Từ Internet" (cần mở cổng TCP 8443 trên router/modem). Đặt "Tên miền riêng" (DDNS, ví dụ DuckDNS miễn phí) để IP nhà đổi vẫn vào được; ở xa chưa ghép thì trên iPhone bấm + > Thêm PC bằng địa chỉ, nhập tên miền + tài khoản.
           4. Keymap có sẵn cho Minecraft, CS2, Valorant, PUBG, Genshin, Star Rail, ZZZ, Wuthering Waves, Roblox, GTA V, MOBA.
+          5. iPhone đã jailbreak có TrollVNC: xem và điều khiển từ PC (trang "iPhone (TrollVNC)") hoặc từ iPhone khác (+ > Thêm iPhone).
           EOF
           # tag có dấu "-" (v1.2.0-beta.1) là bản thử: pre-release, không thành "latest" nên app tự cập nhật bỏ qua
           PRE=$([[ "$TAG" == *-* ]] && echo --prerelease || true)

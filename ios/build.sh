@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build app iPhone Remote Desk (cần Mac có Xcode 16 trở lên).
+# Build app iPhone Remote Desk (cần Mac có Xcode 26 trở lên: SDK iOS 26 cho kính lỏng).
 #   bash ios/build.sh          -> ios/build/RemoteDesk-unsigned.ipa (ký và cài bằng Sideloadly như WDA.ipa)
 #   bash ios/build.sh --test   -> chạy self-test trên iOS Simulator
 #   VERSION=1.2.0 bash ios/build.sh -> ghi số phiên bản vào app (app so với GitHub Release để báo bản mới)
