@@ -70,16 +70,16 @@ enum SelfTest {
         check(fire?.mode == .turbo && fire?.aim == true && fire?.scale == 1.5, "đọc nút liên thanh + kéo để ngắm")
 
         // Địa chỉ: Wi‑Fi thử LAN trước, 4G thử Tailscale trước, không trùng lặp
-        let pc = SavedHost(name: "PC", address: "192.168.0.103:8443", addresses: ["192.168.0.103:8443", "100.99.115.103:8443"])
-        check(pc.candidates(onWiFi: true) == ["192.168.0.103:8443", "100.99.115.103:8443"], "thứ tự trên Wi‑Fi")
-        check(pc.candidates(onWiFi: false) == ["100.99.115.103:8443", "192.168.0.103:8443"], "thứ tự trên 4G")
+        let pc = SavedHost(name: "PC", address: "192.168.0.103:8443", addresses: ["192.168.0.103:8443", "100.100.1.2:8443"])
+        check(pc.candidates(onWiFi: true) == ["192.168.0.103:8443", "100.100.1.2:8443"], "thứ tự trên Wi‑Fi")
+        check(pc.candidates(onWiFi: false) == ["100.100.1.2:8443", "192.168.0.103:8443"], "thứ tự trên 4G")
         check(SavedHost.isTailscale("100.64.0.1:8443") && !SavedHost.isTailscale("100.128.0.1") && !SavedHost.isTailscale("10.0.0.1"),
               "dải Tailscale")
         let out = SavedHost(name: "PC", address: "192.168.0.103:8443",
-                            addresses: ["192.168.0.103:8443", "14.162.162.13:8443", "100.99.115.103:8443"])
-        check(out.candidates(onWiFi: false).first == "14.162.162.13:8443" && out.candidates(onWiFi: true).last == "14.162.162.13:8443",
+                            addresses: ["192.168.0.103:8443", "203.0.113.7:8443", "100.100.1.2:8443"])
+        check(out.candidates(onWiFi: false).first == "203.0.113.7:8443" && out.candidates(onWiFi: true).last == "203.0.113.7:8443",
               "IP công khai: 4G thử trước, Wi‑Fi thử sau cùng")
-        check(SavedHost.kind("172.20.10.2:8443") == .lan && SavedHost.kind("14.162.162.13:8443") == .internet
+        check(SavedHost.kind("172.20.10.2:8443") == .lan && SavedHost.kind("203.0.113.7:8443") == .internet
               && SavedHost.kind("my-pc.local:8443") == .lan && SavedHost.kind("Nha.DuckDNS.org:8443") == .internet
               && SavedHost.kind("mypc:8443") == .lan, "phân loại địa chỉ")
 
@@ -123,9 +123,9 @@ enum SelfTest {
 
         print("self-test: xong bố cục")
         // Mã QR trên PC: địa chỉ thiếu cổng thì thêm 8443, chứng chỉ ghi sẵn để khỏi hỏi tin
-        let qr = URL(string: "remotedesk://pair?n=DESKTOP-1&a=192.168.0.103,14.162.162.13:9000&c=0123abcd&f=AABB")!
+        let qr = URL(string: "remotedesk://pair?n=DESKTOP-1&a=192.168.0.103,203.0.113.7:9000&c=0123abcd&f=AABB")!
         let pr = SavedHost.pair(qr)
-        check(pr?.host.address == "192.168.0.103:8443" && pr?.host.addresses == ["192.168.0.103:8443", "14.162.162.13:9000"]
+        check(pr?.host.address == "192.168.0.103:8443" && pr?.host.addresses == ["192.168.0.103:8443", "203.0.113.7:9000"]
               && pr?.code == "0123abcd" && pr?.host.certHash == "aabb" && pr?.host.name == "DESKTOP-1", "đọc mã QR")
         check(SavedHost.pair(URL(string: "remotedesk://pair?a=1.2.3.4")!) == nil && SavedHost.pair(URL(string: "https://x/pair?a=1&c=2")!) == nil,
               "mã QR thiếu mã hoặc sai loại")

@@ -3888,7 +3888,7 @@ static int self_test() {
               ddns_norm("a..b").empty() && ddns_norm(".x").empty() && ddns_norm("nhà").empty() && ddns_norm("").empty());
     }
     CHECK(is_private("192.168.0.103") && is_private("100.99.1.1") && is_private("172.20.10.2") && is_private("127.0.0.1"));
-    CHECK(!is_private("14.162.162.13") && !is_private("172.32.0.1") && !is_private("100.128.0.1"));
+    CHECK(!is_private("203.0.113.7") && !is_private("172.32.0.1") && !is_private("100.128.0.1"));
     for (int i = 0; i < 4; i++) auth_failed("203.0.113.9");
     CHECK(!auth_locked("203.0.113.9"));
     auth_failed("203.0.113.9");
@@ -3907,7 +3907,7 @@ static int self_test() {
     CHECK(adapt_bitrate(20, 20, 0.8, calm) == 14 && adapt_bitrate(2, 20, 0.9, calm) == 2);
     CHECK(adapt_bitrate(14, 20, 0.05, calm) == 14 && adapt_bitrate(14, 20, 0.05, calm) == 16);
     CHECK(adapt_bitrate(20, 20, 0.05, calm) == 20 && adapt_bitrate(14, 20, 0.3, calm) == 14 && calm == 0);
-    CHECK(is_tailscale("100.99.115.103") && !is_tailscale("100.20.1.1") && !is_tailscale("192.168.0.103"));
+    CHECK(is_tailscale("100.100.1.2") && !is_tailscale("100.20.1.1") && !is_tailscale("192.168.0.103"));
     // Màu: trắng -> Y 235, đen -> Y 16, xám -> U/V 128
     std::vector<uint8_t> px = {255, 255, 255, 0, 0, 0, 0, 0, 128, 128, 128, 0, 128, 128, 128, 0}, nv(6);
     bgra_to_nv12(px.data(), 2, 2, nv.data(), 2, 2);

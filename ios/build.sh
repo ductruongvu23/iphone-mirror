@@ -67,7 +67,7 @@ PY
   hosts=$(printf '%s' '[{"name":"MAY-CHOI-GAME","address":"192.168.0.102:8443"},{"name":"PC văn phòng","address":"nha.duckdns.org:8443"}]' | xxd -p | tr -d '\n')
   dns-sd -R "MAY-CHOI-GAME" _remotedesk._tcp local 8443 > /dev/null 2>&1 &
   b1=$!
-  dns-sd -R "TrollVNC-60bdc162" _rfb._tcp local 5901 > /dev/null 2>&1 &
+  dns-sd -R "TrollVNC-1a2b3c4d" _rfb._tcp local 5901 > /dev/null 2>&1 &
   b2=$!
   sleep 2
   for mode in light dark; do
